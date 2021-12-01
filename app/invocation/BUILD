@@ -29,6 +29,7 @@ ts_library(
         "//app/target",
         "//app/terminal",
         "//app/util:errors",
+        "//app/util:varint",
         "//proto:acl_ts_proto",
         "//proto:build_event_stream_ts_proto",
         "//proto:cache_ts_proto",

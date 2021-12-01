@@ -94,3 +94,12 @@ ts_library(
         "//proto:timestamp_ts_proto",
     ],
 )
+
+ts_library(
+    name = "varint",
+    srcs = ["varint.ts"],
+    deps = [
+        "@npm//@types/long",
+        "@npm//long",
+    ],
+)

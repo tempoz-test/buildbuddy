@@ -154,6 +154,7 @@ func serveIndexTemplate(env environment.Env, tpl *template.Template, version str
 		GlobalFilterEnabled:        env.GetConfigurator().GetAppGlobalFilterEnabled(),
 		UsageEnabled:               env.GetConfigurator().GetAppUsageEnabled(),
 		UserManagementEnabled:      env.GetConfigurator().GetAppUserManagementEnabled(),
+		StreamInvocationEvents:     env.GetConfigurator().GetAppStreamInvocationEvents(),
 	}
 
 	configJSON := &bytes.Buffer{}

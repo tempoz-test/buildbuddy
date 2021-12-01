@@ -50,4 +50,8 @@ message FrontendConfig {
 
   // Whether or not user management is enabled.
   bool user_management_enabled = 16;
+
+  // Whether or not the UI should stream invocation events as a separate RPC,
+  // rather than loading them via GetInvocation.
+  bool stream_invocation_events = 17;
 }

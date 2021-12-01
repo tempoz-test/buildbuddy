@@ -59,6 +59,7 @@ type appConfig struct {
 	CodeEditorEnabled         bool     `yaml:"code_editor_enabled" usage:"If set, code editor functionality will be enabled."`
 	UserManagementEnabled     bool     `yaml:"user_management_enabled" usage:"If set, the user management page will be enabled in the UI."`
 	GlobalFilterEnabled       bool     `yaml:"global_filter_enabled" usage:"If set, the global filter will be enabled in the UI."`
+	StreamInvocationEvents    bool     `yaml:"stream_invocation_events" usage:"If true, the UI will stream invocation events as a separate RPC rather than loading them in GetInvocation."`
 	UsageEnabled              bool     `yaml:"usage_enabled" usage:"If set, the usage page will be enabled in the UI."`
 	UsageStartDate            string   `yaml:"usage_start_date" usage:"If set, usage data will only be viewable on or after this timestamp. Specified in RFC3339 format, like 2021-10-01T00:00:00Z"`
 	UsageTrackingEnabled      bool     `yaml:"usage_tracking_enabled" usage:"If set, enable usage data collection."`
@@ -586,6 +587,10 @@ func (c *Configurator) GetDefaultToDenseMode() bool {
 
 func (c *Configurator) GetCodeEditorEnabled() bool {
 	return c.gc.App.CodeEditorEnabled
+}
+
+func (c *Configurator) GetAppStreamInvocationEvents() bool {
+	return c.gc.App.StreamInvocationEvents
 }
 
 func (c *Configurator) GetAppUserManagementEnabled() bool {
