@@ -13,9 +13,11 @@ import (
 
 	"github.com/buildbuddy-io/buildbuddy/server/environment"
 	"github.com/buildbuddy-io/buildbuddy/server/tables"
+	"github.com/buildbuddy-io/buildbuddy/server/util/authutil"
 	"github.com/buildbuddy-io/buildbuddy/server/util/log"
 	"github.com/buildbuddy-io/buildbuddy/server/util/perms"
 	"github.com/buildbuddy-io/buildbuddy/server/util/random"
+	"github.com/buildbuddy-io/buildbuddy/server/util/role"
 	"github.com/buildbuddy-io/buildbuddy/server/util/status"
 )
 
@@ -30,6 +32,7 @@ const (
 	stateCookieName    = "Github-State-Token"
 	redirectCookieName = "Github-Redirect-Url"
 	groupIDCookieName  = "Github-Linked-Group-ID"
+	userIDCookieName   = "Github-Linked-User-ID"
 )
 
 // State represents a status value that GitHub's statuses API understands.
@@ -83,6 +86,7 @@ func (c *GithubClient) Link(w http.ResponseWriter, r *http.Request) {
 	if r.FormValue("state") == "" {
 		state := fmt.Sprintf("%d", random.RandUint64())
 		setCookie(w, stateCookieName, state)
+		setCookie(w, userIDCookieName, r.FormValue("user_id"))
 		setCookie(w, groupIDCookieName, r.FormValue("group_id"))
 		setCookie(w, redirectCookieName, r.FormValue("redirect_url"))
 
@@ -136,10 +140,9 @@ func (c *GithubClient) Link(w http.ResponseWriter, r *http.Request) {
 	var accessTokenResponse GithubAccessTokenResponse
 	json.Unmarshal(body, &accessTokenResponse)
 
-	// Restore group ID from cookie.
-	groupID := getCookie(r, groupIDCookieName)
-	if err := perms.AuthorizeGroupAccess(r.Context(), c.env, groupID); err != nil {
-		redirectWithError(w, r, status.PermissionDeniedErrorf("Group auth failed; not linking GitHub account: %s", err.Error()))
+	u, err := perms.AuthenticatedUser(r.Context(), c.env)
+	if err != nil {
+		redirectWithError(w, r, status.WrapError(err, "Failed to link GitHub account"))
 		return
 	}
 
@@ -149,12 +152,35 @@ func (c *GithubClient) Link(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	err = dbHandle.Exec(
-		"UPDATE Groups SET github_token = ? WHERE group_id = ?",
-		accessTokenResponse.AccessToken, groupID).Error
-	if err != nil {
-		redirectWithError(w, r, status.PermissionDeniedErrorf("Error linking github account to user: %v", err))
-		return
+	// Restore group ID from cookie.
+	groupID := getCookie(r, groupIDCookieName)
+	if groupID != "" {
+		if err := authutil.AuthorizeGroupRole(u, groupID, role.Admin); err != nil {
+			redirectWithError(w, r, status.WrapError(err, "Failed to link GitHub account"))
+			return
+		}
+		err = dbHandle.Exec(
+			`UPDATE `+"`Groups`"+` SET github_token = ? WHERE group_id = ?`,
+			accessTokenResponse.AccessToken, groupID).Error
+		if err != nil {
+			redirectWithError(w, r, status.PermissionDeniedErrorf("Error linking github account to group: %v", err))
+			return
+		}
+	}
+
+	// Restore user ID from cookie.
+	userID := getCookie(r, userIDCookieName)
+	if userID != "" {
+		if userID != u.GetUserID() {
+			redirectWithError(w, r, status.PermissionDeniedErrorf("Invalid user: %v", userID))
+		}
+		err = dbHandle.Exec(
+			`UPDATE `+"`Users`"+` SET github_token = ? WHERE user_id = ?`,
+			accessTokenResponse.AccessToken, userID).Error
+		if err != nil {
+			redirectWithError(w, r, status.PermissionDeniedErrorf("Error linking github account to user: %v", err))
+			return
+		}
 	}
 
 	redirectUrl := getCookie(r, redirectCookieName)
@@ -229,7 +255,9 @@ func (c *GithubClient) populateTokenIfNecessary(ctx context.Context) error {
 		return err
 	}
 
-	c.githubToken = group.GithubToken
+	if group.GithubToken != nil {
+		c.githubToken = *group.GithubToken
+	}
 	return nil
 }
 

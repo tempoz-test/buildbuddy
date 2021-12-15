@@ -4,13 +4,16 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"io"
+	"io/fs"
 	"os"
+	"path"
 	"path/filepath"
 	"strings"
 	"sync"
 
-	"github.com/buildbuddy-io/buildbuddy/enterprise/server/remote_execution/casfs"
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/remote_execution/dirtools"
+	"github.com/buildbuddy-io/buildbuddy/enterprise/server/remote_execution/vfs"
 	"github.com/buildbuddy-io/buildbuddy/server/environment"
 	"github.com/buildbuddy-io/buildbuddy/server/interfaces"
 	"github.com/buildbuddy-io/buildbuddy/server/remote_cache/cachetools"
@@ -34,23 +37,30 @@ var (
 // Workspace holds the working tree for an action and keeps track of
 // inputs and outputs.
 type Workspace struct {
-	env       environment.Env
-	rootDir   string
+	env     environment.Env
+	rootDir string
+	// dirPerms are the permissions set on the workspace root directory as well as
+	// any input or output directories created by the executor. It does not affect
+	// file permissions.
+	dirPerms  fs.FileMode
 	task      *repb.ExecutionTask
 	dirHelper *dirtools.DirHelper
 	Opts      *Opts
-	casFs     *casfs.CASFS
+	vfs       *vfs.VFS
 	// Action input files known to exist in the workspace, as a map of
-	// workspace-relative paths to digests.
+	// workspace-relative paths to file nodes.
 	// TODO: Make sure these files are written read-only
 	// to make sure this map accurately reflects the filesystem.
-	Inputs map[string]*repb.Digest
+	Inputs map[string]*repb.FileNode
 
 	mu       sync.Mutex // protects(removing)
 	removing bool
 }
 
 type Opts struct {
+	// NonrootWritable specifies whether the workspace dir, as well as directories
+	// created under it, should be writable by nonroot users.
+	NonrootWritable bool
 	// Preserve specifies whether to preserve all files in the workspace except
 	// for output dirs.
 	Preserve    bool
@@ -64,15 +74,20 @@ func New(env environment.Env, parentDir string, opts *Opts) (*Workspace, error) 
 		return nil, status.UnavailableErrorf("failed to generate workspace ID")
 	}
 	rootDir := filepath.Join(parentDir, id.String())
-	if err := os.MkdirAll(rootDir, 0755); err != nil {
+	dirPerms := fs.FileMode(0755)
+	if opts.NonrootWritable {
+		dirPerms = 0777
+	}
+	if err := os.MkdirAll(rootDir, dirPerms); err != nil {
 		return nil, status.UnavailableErrorf("failed to create workspace at %q", rootDir)
 	}
 
 	return &Workspace{
-		env:     env,
-		rootDir: rootDir,
-		Opts:    opts,
-		Inputs:  map[string]*repb.Digest{},
+		env:      env,
+		rootDir:  rootDir,
+		dirPerms: dirPerms,
+		Opts:     opts,
+		Inputs:   map[string]*repb.FileNode{},
 	}, nil
 }
 
@@ -86,7 +101,7 @@ func (ws *Workspace) SetTask(task *repb.ExecutionTask) {
 	log.Debugf("Assigned task %s to workspace at %q", task.GetExecutionId(), ws.rootDir)
 	ws.task = task
 	cmd := task.GetCommand()
-	ws.dirHelper = dirtools.NewDirHelper(ws.Path(), cmd.GetOutputFiles(), cmd.GetOutputDirectories())
+	ws.dirHelper = dirtools.NewDirHelper(ws.Path(), cmd.GetOutputFiles(), cmd.GetOutputDirectories(), ws.dirPerms)
 }
 
 // CommandWorkingDirectory returns the absolute path to the working directory
@@ -126,7 +141,9 @@ func (ws *Workspace) DownloadInputs(ctx context.Context, tree *repb.Tree) (*dirt
 	ctx, span := tracing.StartSpan(ctx)
 	defer span.End()
 
-	opts := &dirtools.DownloadTreeOpts{}
+	opts := &dirtools.DownloadTreeOpts{
+		NonrootWritable: ws.Opts.NonrootWritable,
+	}
 	if ws.Opts.Preserve {
 		opts.Skip = ws.Inputs
 		opts.TrackTransfers = true
@@ -137,8 +154,8 @@ func (ws *Workspace) DownloadInputs(ctx context.Context, tree *repb.Tree) (*dirt
 			return txInfo, err
 		}
 
-		for path, digest := range txInfo.Transfers {
-			ws.Inputs[path] = digest
+		for path, node := range txInfo.Transfers {
+			ws.Inputs[path] = node
 		}
 		mbps := (float64(txInfo.BytesTransferred) / float64(1e6)) / float64(txInfo.TransferDuration.Seconds())
 		log.Debugf("GetTree downloaded %d bytes in %s [%2.2f MB/sec]", txInfo.BytesTransferred, txInfo.TransferDuration, mbps)
@@ -146,19 +163,47 @@ func (ws *Workspace) DownloadInputs(ctx context.Context, tree *repb.Tree) (*dirt
 	return txInfo, err
 }
 
-func (ws *Workspace) CleanInputsIfNecessary(keep map[string]*repb.Digest) error {
+// AddCIRunner adds the BuildBuddy CI runner to the workspace root if it doesn't
+// already exist.
+func (ws *Workspace) AddCIRunner() error {
+	destPath := path.Join(ws.Path(), "buildbuddy_ci_runner")
+	exists, err := disk.FileExists(destPath)
+	if err != nil {
+		return err
+	}
+	if exists {
+		return nil
+	}
+	// TODO(bduffany): Consider doing a fastcopy here instead of a normal copy.
+	// The CI runner binary may be on a different device than the runner workspace
+	// so we'd have to put it somewhere on the same device before fastcopying.
+	srcFile, err := ws.env.GetFileResolver().Open("enterprise/server/cmd/ci_runner/buildbuddy_ci_runner")
+	if err != nil {
+		return err
+	}
+	defer srcFile.Close()
+	destFile, err := os.OpenFile(destPath, os.O_CREATE|os.O_TRUNC|os.O_RDWR, 0555)
+	if err != nil {
+		return err
+	}
+	defer destFile.Close()
+	_, err = io.Copy(destFile, srcFile)
+	return err
+}
+
+func (ws *Workspace) CleanInputsIfNecessary(keep map[string]*repb.FileNode) error {
 	if ws.Opts.CleanInputs == "" {
 		return nil
 	}
-	inputFilesToCleanUp := make(map[string]*repb.Digest)
+	inputFilesToCleanUp := make(map[string]*repb.FileNode)
 	// Curly braces indicate a comma separated list of patterns: https://pkg.go.dev/github.com/gobwas/glob#Compile
 	glob, err := glob.Compile(fmt.Sprintf("{%s}", ws.Opts.CleanInputs), os.PathSeparator)
 	if err != nil {
 		return status.FailedPreconditionErrorf("Invalid glob {%s} used for input cleaning: %s", ws.Opts.CleanInputs, err.Error())
 	}
-	for path, digest := range ws.Inputs {
+	for path, node := range ws.Inputs {
 		if ws.Opts.CleanInputs == "*" || glob.Match(path) {
-			inputFilesToCleanUp[path] = digest
+			inputFilesToCleanUp[path] = node
 		}
 	}
 	for path, _ := range keep {

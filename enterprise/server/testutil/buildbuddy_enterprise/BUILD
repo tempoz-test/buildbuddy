@@ -10,5 +10,12 @@ go_library(
     ],
     importpath = "github.com/buildbuddy-io/buildbuddy/enterprise/server/testutil/buildbuddy_enterprise",
     visibility = ["//visibility:public"],
-    deps = ["//server/testutil/app"],
+    deps = [
+        "//enterprise/server/testutil/testredis",
+        "//proto:context_go_proto",
+        "//proto:user_go_proto",
+        "//server/testutil/app",
+        "@com_github_golang_protobuf//proto:go_default_library",
+        "@com_github_stretchr_testify//require",
+    ],
 )

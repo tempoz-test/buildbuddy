@@ -6,17 +6,47 @@
   display: flex;
   flex-direction: column;
   box-sizing: border-box;
-  padding: 32px;
   overflow: auto;
   overflow-x: hidden;
   font-size: 18px;
   user-select: none;
 }
 
+.sidebar {
+  --sidebar-padding: 32px;
+  color: #fff;
+}
+
+.dense .sidebar {
+  --sidebar-padding: 16px;
+}
+
+/* Applying border padding to children so that background colors can extend to the sidebar edges. */
+
+.sidebar > * {
+  padding: 0 var(--sidebar-padding);
+}
+
+.sidebar > :first-child {
+  padding-top: var(--sidebar-padding);
+}
+
+.sidebar > :last-child {
+  padding-bottom: var(--sidebar-padding);
+}
+
+.sidebar .sidebar-footer {
+  padding: 0;
+}
+
 .sidebar .logo {
-  width: 100%;
   max-width: 216px;
+  height: 36px;
   box-sizing: border-box;
+}
+
+.dense .sidebar .logo {
+  height: 24.7px;
 }
 
 .sidebar .sidebar-header {
@@ -27,13 +57,7 @@
   display: flex;
   align-items: center;
   cursor: pointer;
-  padding: 24px 24px 24px 32px;
-  margin: 0 0 -32px 0;
   font-size: 16px;
-}
-
-.sidebar .sidebar-profile:hover {
-  background-color: #455a64;
 }
 
 .sidebar .sidebar-profile-photo {
@@ -68,6 +92,10 @@
 .sidebar .sidebar-body {
   flex-grow: 1;
   overflow: auto;
+
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
 }
 
 .sidebar .sidebar-body::-webkit-scrollbar {
@@ -75,12 +103,11 @@
 }
 
 .sidebar .sidebar-item {
-  margin-bottom: 16px;
   cursor: pointer;
   font-weight: 600;
   display: flex;
   align-items: center;
-  color: rgb(255, 255, 255, 0.8);
+  color: #90a4ae;
 }
 
 .sidebar .sidebar-item:hover,
@@ -88,33 +115,41 @@
   color: #fff;
 }
 
-.sidebar .sidebar-item img {
+.sidebar .sidebar-item svg {
   margin-right: 16px;
   width: 18px;
   height: 18px;
-  opacity: 0.5;
+  stroke: #90a4ae;
 }
 
-.sidebar .sidebar-item:hover img,
-.sidebar .sidebar-item.selected img {
-  opacity: 1;
+.sidebar .sidebar-item:hover svg,
+.sidebar .sidebar-item.selected svg {
+  stroke: white;
 }
 
-.sidebar .sidebar-footer {
-  margin: 0 -32px 0 -32px;
-}
-
+.sidebar .sidebar-footer:hover,
 .sidebar .sidebar-footer.expanded {
   background-color: #455a64;
 }
 
+.sidebar .sidebar-profile,
 .sidebar .sidebar-expanded-profile {
-  padding: 24px 32px 0 32px;
-  color: #fff;
+  padding: 24px var(--sidebar-padding);
 }
 
-.sidebar .sidebar-footer.expanded .sidebar-profile {
-  background-color: #455a64;
+.dense .sidebar .sidebar-profile,
+.dense .sidebar .sidebar-expanded-profile {
+  padding: 16px var(--sidebar-padding);
+}
+
+.sidebar .sidebar-expanded-profile {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.sidebar .sidebar-expanded-profile {
+  margin-bottom: -8px;
 }
 
 .sidebar .default-photo {
@@ -123,11 +158,18 @@
 }
 
 .sidebar .sidebar-profile-arrow {
-  opacity: 0.7;
+  stroke: #90a4ae;
   margin-left: 4px;
+  margin-right: -4px;
 }
 
 /** Org picker */
+
+.sidebar .org-picker {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
 
 .sidebar .org-picker-header {
   font-size: 15px;
@@ -137,12 +179,14 @@
 }
 
 .sidebar .org-list {
-  margin-top: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
 }
 
-.sidebar .create-organization {
-  margin-bottom: 16px;
-  padding-bottom: 16px;
+.sidebar hr {
+  margin: 0;
+  border: 0;
   border-bottom: 1px solid rgba(255, 255, 255, 0.1);
 }
 
@@ -171,22 +215,12 @@
 
 .dense .sidebar {
   width: 180px;
-  padding: 16px;
   font-size: 15px;
 }
 
 .dense .sidebar,
 .dense .sidebar .sidebar-item {
   font-size: 16px;
-}
-
-.dense .sidebar .sidebar-footer {
-  margin: 0 -16px 0 -16px;
-}
-
-.dense .sidebar .sidebar-profile {
-  padding: 16px;
-  margin: 0 0 -12px 0;
 }
 
 .dense .sidebar .sidebar-profile-photo {
@@ -197,11 +231,7 @@
   margin-left: 0;
 }
 
-.dense .sidebar .sidebar-expanded-profile {
-  padding: 16px 16px 0 16px;
-}
-
-.dense .sidebar .sidebar-item img {
+.dense .sidebar .sidebar-item svg {
   margin-right: 12px;
   width: 16px;
   height: 16px;

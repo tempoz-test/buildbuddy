@@ -372,9 +372,9 @@ func (s3c *S3Cache) contains(ctx context.Context, key string) (bool, error) {
 	return s3c.bumpTTLIfStale(ctx, key, *head.LastModified), nil
 }
 
-func (s3c *S3Cache) ContainsMulti(ctx context.Context, digests []*repb.Digest) (map[*repb.Digest]bool, error) {
-	lock := sync.RWMutex{} // protects(foundMap)
-	foundMap := make(map[*repb.Digest]bool, len(digests))
+func (s3c *S3Cache) FindMissing(ctx context.Context, digests []*repb.Digest) ([]*repb.Digest, error) {
+	lock := sync.RWMutex{} // protects(missing)
+	var missing []*repb.Digest
 	eg, ctx := errgroup.WithContext(ctx)
 
 	for _, d := range digests {
@@ -384,9 +384,11 @@ func (s3c *S3Cache) ContainsMulti(ctx context.Context, digests []*repb.Digest) (
 				if err != nil {
 					return err
 				}
-				lock.Lock()
-				defer lock.Unlock()
-				foundMap[d] = exists
+				if !exists {
+					lock.Lock()
+					defer lock.Unlock()
+					missing = append(missing, d)
+				}
 				return nil
 			})
 		}
@@ -397,7 +399,7 @@ func (s3c *S3Cache) ContainsMulti(ctx context.Context, digests []*repb.Digest) (
 		return nil, err
 	}
 
-	return foundMap, nil
+	return missing, nil
 }
 
 func (s3c *S3Cache) Reader(ctx context.Context, d *repb.Digest, offset int64) (io.ReadCloser, error) {

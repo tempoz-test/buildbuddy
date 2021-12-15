@@ -68,7 +68,7 @@ func TestCreateUser_Cloud_CreatesSelfOwnedGroup(t *testing.T) {
 
 	require.Len(t, u.Groups, 1, "cloud users should be added to their self-owned group")
 
-	selfOwnedGroup := u.Groups[0]
+	selfOwnedGroup := u.Groups[0].Group
 	require.Equal(t, "US1", selfOwnedGroup.UserID, "user ID of self-owned group should be the owner's user ID")
 
 	groupUsers, err := udb.GetGroupUsers(ctx1, selfOwnedGroup.GroupID, []grp.GroupMembershipStatus{grp.GroupMembershipStatus_MEMBER})
@@ -111,14 +111,14 @@ func TestCreateUser_OnPrem_OnlyFirstUserCreatedShouldBeMadeAdminOfDefaultGroup(t
 
 	require.Len(t, u.Groups, 1, "US1 should be added to the default group")
 
-	defaultGroup := u.Groups[0]
+	defaultGroup := u.Groups[0].Group
 	groupUsers, err := udb.GetGroupUsers(ctx1, defaultGroup.GroupID, []grp.GroupMembershipStatus{grp.GroupMembershipStatus_MEMBER})
 	require.NoError(t, err)
 	require.Len(t, groupUsers, 2, "default group should have 2 members")
 	us1 := findGroupUser(t, "US1", groupUsers)
 	require.Equal(t, grpb.Group_ADMIN_ROLE, us1.Role, "first user added to the default group should be made an admin")
 	us2 := findGroupUser(t, "US2", groupUsers)
-	require.Equal(t, grpb.Group_ADMIN_ROLE, us2.Role, "second user added to the default group should have the default role")
+	require.Equal(t, grpb.Group_DEVELOPER_ROLE, us2.Role, "second user added to the default group should have the default role")
 }
 
 func TestAddUserToGroup_AddsUserWithDefaultRole(t *testing.T) {
@@ -151,7 +151,7 @@ func TestAddUserToGroup_AddsUserWithDefaultRole(t *testing.T) {
 	u, err := udb.GetUser(ctx1)
 	require.NoError(t, err)
 	require.Len(t, u.Groups, 1, "cloud users should be added to their self-owned group")
-	us1Group := u.Groups[0]
+	us1Group := u.Groups[0].Group
 
 	// Add US2 to it
 	ctx2 := authUserCtx(ctx, env, t, "US2")
@@ -162,8 +162,42 @@ func TestAddUserToGroup_AddsUserWithDefaultRole(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, groupUsers, 2, "US1's group should have 2 members after adding US2")
 	us2 := findGroupUser(t, "US2", groupUsers)
-	// TODO(bduffany): This should be DEVELOPER once we have a user management UI.
-	require.Equal(t, grpb.Group_ADMIN_ROLE, us2.Role, "users should have default role after being added to another group")
+	require.Equal(t, grpb.Group_DEVELOPER_ROLE, us2.Role, "users should have default role after being added to another group")
+}
+
+func TestAddUserToGroup_EmptyGroup_UserGetsAdminRole(t *testing.T) {
+	flags.Set(t, "app.create_group_per_user", "true")
+	flags.Set(t, "app.no_default_user_group", "true")
+	env := newTestEnv(t)
+	udb := env.GetUserDB()
+	ctx := context.Background()
+
+	// Create a user
+	err := udb.InsertUser(ctx, &tables.User{
+		UserID:    "US1",
+		SubID:     "SubID1",
+		FirstName: "FirstName1",
+		LastName:  "LastName1",
+		Email:     "user1@org1.io",
+	})
+	require.NoError(t, err)
+	// Create an empty group
+	slug := "foo"
+	groupID, err := udb.InsertOrUpdateGroup(ctx, &tables.Group{
+		URLIdentifier: &slug,
+	})
+	require.NoError(t, err)
+	// Add US1 to it
+	err = udb.AddUserToGroup(ctx, "US1", groupID)
+	require.NoError(t, err)
+
+	// Make sure they are the group admin
+	ctx1 := authUserCtx(ctx, env, t, "US1")
+	groupUsers, err := udb.GetGroupUsers(ctx1, groupID, []grp.GroupMembershipStatus{grp.GroupMembershipStatus_MEMBER})
+	require.NoError(t, err)
+	require.Len(t, groupUsers, 1)
+	gu := groupUsers[0]
+	require.Equal(t, grpb.Group_ADMIN_ROLE, gu.Role, "users should have admin role when added to a new group")
 }
 
 func TestUpdateGroupUsers_Role(t *testing.T) {
@@ -188,7 +222,7 @@ func TestUpdateGroupUsers_Role(t *testing.T) {
 	u, err := udb.GetUser(ctx1)
 	require.NoError(t, err)
 	require.Len(t, u.Groups, 1, "cloud users should be added to their self-owned group")
-	us1Group := u.Groups[0]
+	us1Group := u.Groups[0].Group
 
 	// Make sure we can update their role within the group
 	err = udb.UpdateGroupUsers(ctx, us1Group.GroupID, []*grpb.UpdateGroupUsersRequest_Update{{

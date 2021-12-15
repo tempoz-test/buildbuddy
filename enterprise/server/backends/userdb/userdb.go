@@ -16,7 +16,6 @@ import (
 	"github.com/buildbuddy-io/buildbuddy/server/util/random"
 	"github.com/buildbuddy-io/buildbuddy/server/util/role"
 	"github.com/buildbuddy-io/buildbuddy/server/util/status"
-	"github.com/buildbuddy-io/buildbuddy/server/util/timeutil"
 
 	akpb "github.com/buildbuddy-io/buildbuddy/proto/api_key"
 	grpb "github.com/buildbuddy-io/buildbuddy/proto/group"
@@ -155,7 +154,12 @@ func (d *UserDB) GetAPIKeys(ctx context.Context, groupID string) ([]*tables.APIK
 		return nil, status.InvalidArgumentError("Group ID cannot be empty.")
 	}
 
-	query := d.h.Raw(`SELECT api_key_id, value, label, perms, capabilities FROM APIKeys WHERE group_id = ?`, groupID)
+	query := d.h.Raw(`
+		SELECT api_key_id, value, label, perms, capabilities
+		FROM APIKeys
+		WHERE group_id = ?
+		ORDER BY label ASC
+	`, groupID)
 	rows, err := query.Rows()
 	if err != nil {
 		return nil, err
@@ -331,7 +335,7 @@ func (d *UserDB) InsertOrUpdateGroup(ctx context.Context, g *tables.Group) (stri
 
 		groupID = g.GroupID
 		res := tx.Exec(`
-			UPDATE Groups SET name = ?, url_identifier = ?, owned_domain = ?, sharing_enabled = ?, 
+			UPDATE `+"`Groups`"+` SET name = ?, url_identifier = ?, owned_domain = ?, sharing_enabled = ?, 
 				use_group_owned_executors = ?
 			WHERE group_id = ?`,
 			g.Name, g.URLIdentifier, g.OwnedDomain, g.SharingEnabled, g.UseGroupOwnedExecutors,
@@ -356,9 +360,21 @@ func (d *UserDB) AddUserToGroup(ctx context.Context, userID string, groupID stri
 		if existing != nil {
 			return status.AlreadyExistsError("You're already in this organization.")
 		}
+		row := &struct{ Count int64 }{}
+		err = tx.Raw(
+			"SELECT COUNT(*) AS count FROM UserGroups WHERE group_group_id = ?", groupID,
+		).Take(row).Error
+		if err != nil {
+			return err
+		}
+		r := role.Default
+		// If no existing users in the group, promote to admin automatically.
+		if row.Count == 0 {
+			r = role.Admin
+		}
 		return tx.Exec(
 			"INSERT INTO UserGroups (user_user_id, group_group_id, membership_status, role) VALUES(?, ?, ?, ?)",
-			userID, groupID, int32(grpb.GroupMembershipStatus_MEMBER), uint32(role.Default),
+			userID, groupID, int32(grpb.GroupMembershipStatus_MEMBER), r,
 		).Error
 	})
 }
@@ -407,6 +423,8 @@ func (d *UserDB) GetGroupUsers(ctx context.Context, groupID string, statuses []g
 	}
 	orQuery, orArgs := o.Build()
 	q = q.AddWhereClause("("+orQuery+")", orArgs...)
+
+	q.SetOrderBy(`u.email`, true /*=ascending*/)
 
 	qString, qArgs := q.Build()
 	rows, err := d.h.Raw(qString, qArgs...).Rows()
@@ -536,7 +554,7 @@ func (d *UserDB) getDefaultGroupConfig() *defaultGroupConfig {
 func (d *UserDB) createUser(ctx context.Context, tx *db.DB, u *tables.User) error {
 	groupIDs := make([]string, 0)
 	for _, group := range u.Groups {
-		hydratedGroup, err := d.getGroupByURLIdentifier(ctx, tx, *group.URLIdentifier)
+		hydratedGroup, err := d.getGroupByURLIdentifier(ctx, tx, *group.Group.URLIdentifier)
 		if err != nil {
 			return err
 		}
@@ -659,7 +677,19 @@ func (d *UserDB) GetUser(ctx context.Context) (*tables.User, error) {
 			return err
 		}
 		groupRows, err := tx.Raw(`
-			SELECT g.* FROM `+"`Groups`"+` as g JOIN UserGroups as ug
+			SELECT
+				g.user_id,
+				g.group_id,
+				g.url_identifier,
+				g.name,
+				g.owned_domain,
+				g.github_token,
+				g.sharing_enabled,
+				g.use_group_owned_executors,
+				g.saml_idp_metadata_url,
+				ug.role
+			FROM `+"`Groups`"+` as g
+			JOIN UserGroups as ug
 			ON g.group_id = ug.group_group_id
 			WHERE ug.user_user_id = ? AND ug.membership_status = ?
 		`, u.GetUserID(), int32(grpb.GroupMembershipStatus_MEMBER)).Rows()
@@ -668,11 +698,23 @@ func (d *UserDB) GetUser(ctx context.Context) (*tables.User, error) {
 		}
 		defer groupRows.Close()
 		for groupRows.Next() {
-			g := &tables.Group{}
-			if err := tx.ScanRows(groupRows, g); err != nil {
+			gr := &tables.GroupRole{}
+			err := groupRows.Scan(
+				&gr.Group.UserID,
+				&gr.Group.GroupID,
+				&gr.Group.URLIdentifier,
+				&gr.Group.Name,
+				&gr.Group.OwnedDomain,
+				&gr.Group.GithubToken,
+				&gr.Group.SharingEnabled,
+				&gr.Group.UseGroupOwnedExecutors,
+				&gr.Group.SamlIdpMetadataUrl,
+				&gr.Role,
+			)
+			if err != nil {
 				return err
 			}
-			user.Groups = append(user.Groups, g)
+			user.Groups = append(user.Groups, gr)
 		}
 		return nil
 	})
@@ -687,8 +729,8 @@ func (d *UserDB) FillCounts(ctx context.Context, stat *telpb.TelemetryStat) erro
 		WHERE 
 			u.created_at_usec >= ? AND
 			u.created_at_usec < ?`,
-		timeutil.ToUsec(time.Now().Truncate(24*time.Hour).Add(-24*time.Hour)),
-		timeutil.ToUsec(time.Now().Truncate(24*time.Hour)))
+		time.Now().Truncate(24*time.Hour).Add(-24*time.Hour).UnixMicro(),
+		time.Now().Truncate(24*time.Hour).UnixMicro())
 
 	if err := counts.Take(stat).Error; err != nil {
 		return err

@@ -4,12 +4,11 @@ import (
 	"context"
 	"io"
 	"sort"
-	"time"
 
 	"github.com/buildbuddy-io/buildbuddy/server/environment"
 	"github.com/buildbuddy-io/buildbuddy/server/interfaces"
-	"github.com/buildbuddy-io/buildbuddy/server/util/background"
 	"github.com/buildbuddy-io/buildbuddy/server/util/log"
+	"github.com/buildbuddy-io/buildbuddy/server/util/status"
 	"github.com/golang/protobuf/ptypes/empty"
 	"google.golang.org/grpc"
 
@@ -72,11 +71,9 @@ func (s *BuildEventProtocolServer) PublishBuildToolEventStream(stream pepb.Publi
 
 	disconnectWithErr := func(e error) error {
 		if channel != nil && streamID != nil {
-			log.Warningf("Marking invocation %q as disconnected: %s", streamID.InvocationId, e)
-			ctx, cancel := background.ExtendContextForFinalization(ctx, 3*time.Second)
-			defer cancel()
-			if err := channel.MarkInvocationDisconnected(ctx, streamID.InvocationId); err != nil {
-				log.Warningf("Error marking invocation %q as disconnected: %s", streamID.InvocationId, err)
+			log.Warningf("Disconnecting invocation %q: %s", streamID.InvocationId, e)
+			if err := channel.FinalizeInvocation(streamID.InvocationId); err != nil {
+				log.Warningf("Error finalizing invocation %q during disconnect: %s", streamID.InvocationId, err)
 			}
 		}
 		return e
@@ -94,9 +91,14 @@ func (s *BuildEventProtocolServer) PublishBuildToolEventStream(stream pepb.Publi
 		if streamID == nil {
 			streamID = in.OrderedBuildEvent.StreamId
 			channel = s.env.GetBuildEventHandler().OpenChannel(ctx, streamID.InvocationId)
+			defer channel.Close()
 		}
 
 		if err := channel.HandleEvent(in); err != nil {
+			if status.IsAlreadyExistsError(err) {
+				log.Warningf("AlreadyExistsError handling event; this means the invocation already exists and may not be retried: %s", err)
+				return err
+			}
 			log.Warningf("Error handling event; this means a broken build command: %s", err)
 			return disconnectWithErr(err)
 		}
@@ -123,7 +125,7 @@ func (s *BuildEventProtocolServer) PublishBuildToolEventStream(stream pepb.Publi
 	if channel != nil {
 		if err := channel.FinalizeInvocation(streamID.GetInvocationId()); err != nil {
 			log.Warningf("Error finalizing invocation %q: %s", streamID.GetInvocationId(), err)
-			return disconnectWithErr(err)
+			return err
 		}
 	}
 
@@ -135,7 +137,7 @@ func (s *BuildEventProtocolServer) PublishBuildToolEventStream(stream pepb.Publi
 		}
 		if err := stream.Send(rsp); err != nil {
 			log.Warningf("Error sending ack stream for invocation %q: %s", streamID.InvocationId, err)
-			return disconnectWithErr(err)
+			return err
 		}
 	}
 	return nil

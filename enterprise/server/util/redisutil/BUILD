@@ -10,6 +10,7 @@ go_library(
     ],
     deps = [
         "//server/interfaces",
+        "//server/util/log",
         "//server/util/status",
         "@com_github_go_redis_redis_extra_redisotel_v8//:redisotel",
         "@com_github_go_redis_redis_v8//:redis",
@@ -27,8 +28,11 @@ go_test(
     ],
     deps = [
         ":redisutil",
+        "//enterprise/server/testutil/testredis",
         "@com_github_go_redis_redis_v8//:redis",
         "@com_github_google_go_cmp//cmp",
         "@com_github_google_go_cmp//cmp/cmpopts",
+        "@com_github_stretchr_testify//assert",
+        "@com_github_stretchr_testify//require",
     ],
 )

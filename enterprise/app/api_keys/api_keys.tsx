@@ -1,5 +1,7 @@
+import { Key } from "lucide-react";
 import React from "react";
 import { User } from "../../../app/auth/auth_service";
+import capabilities from "../../../app/capabilities/capabilities";
 import FilledButton, { OutlinedButton } from "../../../app/components/button/button";
 import Dialog, {
   DialogBody,
@@ -8,8 +10,8 @@ import Dialog, {
   DialogHeader,
   DialogTitle,
 } from "../../../app/components/dialog/dialog";
-import capabilities from "../../../app/capabilities/capabilities";
 import TextInput from "../../../app/components/input/input";
+import Spinner from "../../../app/components/spinner/spinner";
 import Modal from "../../../app/components/modal/modal";
 import errorService from "../../../app/errors/error_service";
 import rpcService from "../../../app/service/rpc_service";
@@ -306,7 +308,7 @@ export default class ApiKeysComponent extends React.Component<ApiKeysComponentPr
             </DialogBody>
             <DialogFooter>
               <DialogFooterButtons>
-                {isSubmitting && <div className="loading"></div>}
+                {isSubmitting && <Spinner />}
                 <OutlinedButton type="button" onClick={onRequestClose}>
                   Cancel
                 </OutlinedButton>
@@ -340,11 +342,13 @@ export default class ApiKeysComponent extends React.Component<ApiKeysComponentPr
 
     return (
       <div className="api-keys">
-        <div>
-          <FilledButton className="create-new-button" onClick={this.onClickCreateNew.bind(this)}>
-            Create new API key
-          </FilledButton>
-        </div>
+        {this.props.user.canCall("createApiKey") && (
+          <div>
+            <FilledButton className="create-new-button" onClick={this.onClickCreateNew.bind(this)}>
+              Create new API key
+            </FilledButton>
+          </div>
+        )}
 
         {this.renderModal({
           title: "New API key",
@@ -379,15 +383,19 @@ export default class ApiKeysComponent extends React.Component<ApiKeysComponentPr
                 <span>{describeCapabilities(key)}</span>
               </div>
               <div className="api-key-value">
-                <img src="/image/key.svg" />
+                <Key className="icon" />
                 <span>{key.value}</span>
               </div>
-              <OutlinedButton className="api-key-edit-button" onClick={this.onClickUpdate.bind(this, key)}>
-                Edit
-              </OutlinedButton>
-              <OutlinedButton onClick={this.onClickDelete.bind(this, key)} className="destructive">
-                Delete
-              </OutlinedButton>
+              {this.props.user.canCall("updateApiKey") && (
+                <OutlinedButton className="api-key-edit-button" onClick={this.onClickUpdate.bind(this, key)}>
+                  Edit
+                </OutlinedButton>
+              )}
+              {this.props.user.canCall("deleteApiKey") && (
+                <OutlinedButton onClick={this.onClickDelete.bind(this, key)} className="destructive">
+                  Delete
+                </OutlinedButton>
+              )}
             </div>
           ))}
         </div>
@@ -414,7 +422,7 @@ export default class ApiKeysComponent extends React.Component<ApiKeysComponentPr
             </DialogBody>
             <DialogFooter>
               <DialogFooterButtons>
-                {this.state.isDeleteModalSubmitting && <div className="loading" />}
+                {this.state.isDeleteModalSubmitting && <Spinner />}
                 <OutlinedButton
                   disabled={this.state.isDeleteModalSubmitting}
                   onClick={this.onCloseDeleteModal.bind(this)}>

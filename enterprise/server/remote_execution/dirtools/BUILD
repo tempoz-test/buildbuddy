@@ -1,4 +1,4 @@
-load("@io_bazel_rules_go//go:def.bzl", "go_library")
+load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
 
 go_library(
     name = "dirtools",
@@ -11,7 +11,6 @@ go_library(
         "//server/interfaces",
         "//server/remote_cache/cachetools",
         "//server/remote_cache/digest",
-        "//server/util/disk",
         "//server/util/fastcopy",
         "//server/util/status",
         "@com_github_golang_protobuf//proto:go_default_library",
@@ -19,5 +18,24 @@ go_library(
         "@org_golang_google_grpc//codes",
         "@org_golang_google_grpc//status",
         "@org_golang_x_sync//errgroup",
+    ],
+)
+
+go_test(
+    name = "dirtools_test",
+    size = "small",
+    srcs = ["dirtools_test.go"],
+    deps = [
+        ":dirtools",
+        "//proto:remote_execution_go_proto",
+        "//server/interfaces",
+        "//server/remote_cache/byte_stream_server",
+        "//server/remote_cache/digest",
+        "//server/testutil/testenv",
+        "//server/testutil/testfs",
+        "//server/util/hash",
+        "//server/util/prefix",
+        "@com_github_stretchr_testify//assert",
+        "@go_googleapis//google/bytestream:bytestream_go_proto",
     ],
 )

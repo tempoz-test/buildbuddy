@@ -21,7 +21,7 @@ import (
 
 const (
 	defaultCutoffSizeBytes = 10000000
-	ttl                    = 259200 * time.Second // 3 days
+	ttl                    = 3 * 24 * time.Hour
 )
 
 var (
@@ -137,7 +137,7 @@ func update(old, new map[string]bool) {
 	}
 }
 
-func (c *Cache) ContainsMulti(ctx context.Context, digests []*repb.Digest) (map[*repb.Digest]bool, error) {
+func (c *Cache) FindMissing(ctx context.Context, digests []*repb.Digest) ([]*repb.Digest, error) {
 	if len(digests) == 0 {
 		return nil, nil
 	}
@@ -158,13 +158,15 @@ func (c *Cache) ContainsMulti(ctx context.Context, digests []*repb.Digest) (map[
 	}
 
 	// Assemble results.
-	response := make(map[*repb.Digest]bool, len(keys))
+	var missing []*repb.Digest
 	for _, k := range keys {
 		d := digestsByKey[k]
 		found, ok := mcMap[k]
-		response[d] = ok && found
+		if !ok || !found {
+			missing = append(missing, d)
+		}
 	}
-	return response, nil
+	return missing, nil
 }
 
 func (c *Cache) Get(ctx context.Context, d *repb.Digest) ([]byte, error) {
@@ -328,24 +330,4 @@ func (c *Cache) Start() error {
 
 func (c *Cache) Stop() error {
 	return nil
-}
-
-func (c *Cache) SetByKey(ctx context.Context, key string, val []byte) error {
-	if val == nil {
-		c.rdb.Del(ctx, key)
-		return nil
-	}
-	return c.rdbSet(ctx, key, val)
-}
-
-func (c *Cache) GetByKey(ctx context.Context, key string) ([]byte, error) {
-	return c.rdbGet(ctx, key)
-}
-
-func (c *Cache) IncrementCount(ctx context.Context, counterName string, n int64) (int64, error) {
-	return c.rdb.IncrBy(ctx, counterName, n).Result()
-}
-
-func (c *Cache) ReadCount(ctx context.Context, counterName string) (int64, error) {
-	return c.rdb.IncrBy(ctx, counterName, 0).Result()
 }

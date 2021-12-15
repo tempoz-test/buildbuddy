@@ -12,6 +12,7 @@ import (
 	"github.com/buildbuddy-io/buildbuddy/server/environment"
 	"github.com/buildbuddy-io/buildbuddy/server/interfaces"
 	"github.com/buildbuddy-io/buildbuddy/server/util/alert"
+	"github.com/buildbuddy-io/buildbuddy/server/util/bytebufferpool"
 	"github.com/buildbuddy-io/buildbuddy/server/util/devnull"
 	"github.com/buildbuddy-io/buildbuddy/server/util/grpc_client"
 	"github.com/buildbuddy-io/buildbuddy/server/util/grpc_server"
@@ -19,6 +20,7 @@ import (
 	"github.com/buildbuddy-io/buildbuddy/server/util/prefix"
 	"github.com/buildbuddy-io/buildbuddy/server/util/status"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/connectivity"
 	"google.golang.org/grpc/reflection"
 
 	dcpb "github.com/buildbuddy-io/buildbuddy/proto/distributed_cache"
@@ -29,13 +31,15 @@ const readBufSizeBytes = 1000000 // 1MB
 
 type dcClient struct {
 	dcpb.DistributedCacheClient
-	conn *grpc.ClientConn
+	conn         *grpc.ClientConn
+	wasEverReady bool
 }
 
 type CacheProxy struct {
 	env                   environment.Env
 	cache                 interfaces.Cache
 	log                   log.Logger
+	bufferPool            *bytebufferpool.Pool
 	mu                    *sync.Mutex
 	server                *grpc.Server
 	clients               map[string]*dcClient
@@ -49,6 +53,7 @@ func NewCacheProxy(env environment.Env, c interfaces.Cache, listenAddr string) *
 		env:        env,
 		cache:      c,
 		log:        log.NamedSubLogger(fmt.Sprintf("CacheProxy(%s)", listenAddr)),
+		bufferPool: bytebufferpool.New(readBufSizeBytes),
 		listenAddr: listenAddr,
 		mu:         &sync.Mutex{},
 		// server goes here
@@ -120,6 +125,14 @@ func (c *CacheProxy) getClient(ctx context.Context, peer string) (dcpb.Distribut
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if client, ok := c.clients[peer]; ok {
+		// The gRPC client library causes RPCs to block while a connection stays in CONNECTING state, regardless of the
+		// failfast setting. This can happen when a replica goes away due to a rollout (or any other reason).
+		isReady := client.conn.GetState() == connectivity.Ready
+		if client.wasEverReady && !isReady {
+			client.conn.Connect()
+			return nil, status.UnavailableErrorf("connection to peer %q is not ready", peer)
+		}
+		client.wasEverReady = client.wasEverReady || isReady
 		return client, nil
 	}
 	log.Debugf("Creating new client for peer: %q", peer)
@@ -151,7 +164,7 @@ func (c *CacheProxy) getCache(ctx context.Context, isolation *dcpb.Isolation) (i
 	return c.cache.WithIsolation(ctx, ct, isolation.GetRemoteInstanceName())
 }
 
-func (c *CacheProxy) ContainsMulti(ctx context.Context, req *dcpb.ContainsMultiRequest) (*dcpb.ContainsMultiResponse, error) {
+func (c *CacheProxy) FindMissing(ctx context.Context, req *dcpb.FindMissingRequest) (*dcpb.FindMissingResponse, error) {
 	ctx, err := prefix.AttachUserPrefixToContext(ctx, c.env)
 	if err != nil {
 		return nil, err
@@ -164,16 +177,13 @@ func (c *CacheProxy) ContainsMulti(ctx context.Context, req *dcpb.ContainsMultiR
 	if err != nil {
 		return nil, err
 	}
-	found, err := cache.ContainsMulti(ctx, digests)
+	missing, err := cache.FindMissing(ctx, digests)
 	if err != nil {
 		return nil, err
 	}
-	rsp := &dcpb.ContainsMultiResponse{}
-	for d, exists := range found {
-		rsp.KeysFound = append(rsp.KeysFound, &dcpb.ContainsMultiResponse_KeysFound{
-			Key:    digestToKey(d),
-			Exists: exists,
-		})
+	rsp := &dcpb.FindMissingResponse{}
+	for _, d := range missing {
+		rsp.Missing = append(rsp.Missing, digestToKey(d))
 	}
 	return rsp, nil
 }
@@ -255,8 +265,9 @@ func (c *CacheProxy) Read(req *dcpb.ReadRequest, stream dcpb.DistributedCache_Re
 	if d.GetSizeBytes() > 0 && d.GetSizeBytes() < bufSize {
 		bufSize = d.GetSizeBytes()
 	}
-	copyBuf := make([]byte, bufSize)
-	_, err = io.CopyBuffer(&streamWriter{stream}, reader, copyBuf)
+	copyBuf := c.bufferPool.Get(bufSize)
+	_, err = io.CopyBuffer(&streamWriter{stream}, reader, copyBuf[:bufSize])
+	c.bufferPool.Put(copyBuf)
 	c.log.Debugf("Read(%q) succeeded (user prefix: %s)", IsolationToString(req.GetIsolation())+d.GetHash(), up)
 	return err
 }
@@ -332,16 +343,15 @@ func (c *CacheProxy) Heartbeat(ctx context.Context, req *dcpb.HeartbeatRequest) 
 }
 
 func (c *CacheProxy) RemoteContains(ctx context.Context, peer string, isolation *dcpb.Isolation, d *repb.Digest) (bool, error) {
-	multiRsp, err := c.RemoteContainsMulti(ctx, peer, isolation, []*repb.Digest{d})
+	missing, err := c.RemoteFindMissing(ctx, peer, isolation, []*repb.Digest{d})
 	if err != nil {
 		return false, err
 	}
-	exists, ok := multiRsp[d]
-	return ok && exists, nil
+	return len(missing) == 0, nil
 }
 
-func (c *CacheProxy) RemoteContainsMulti(ctx context.Context, peer string, isolation *dcpb.Isolation, digests []*repb.Digest) (map[*repb.Digest]bool, error) {
-	req := &dcpb.ContainsMultiRequest{
+func (c *CacheProxy) RemoteFindMissing(ctx context.Context, peer string, isolation *dcpb.Isolation, digests []*repb.Digest) ([]*repb.Digest, error) {
+	req := &dcpb.FindMissingRequest{
 		Isolation: isolation,
 	}
 	hashDigests := make(map[string]*repb.Digest, len(digests))
@@ -354,18 +364,18 @@ func (c *CacheProxy) RemoteContainsMulti(ctx context.Context, peer string, isola
 	if err != nil {
 		return nil, err
 	}
-	rsp, err := client.ContainsMulti(ctx, req)
+	rsp, err := client.FindMissing(ctx, req)
 	if err != nil {
 		return nil, err
 	}
-	resultMap := make(map[*repb.Digest]bool, len(rsp.GetKeysFound()))
-	for _, keyFound := range rsp.GetKeysFound() {
-		d, ok := hashDigests[keyFound.GetKey().GetKey()]
-		if ok {
-			resultMap[d] = keyFound.GetExists()
-		}
+	var missing []*repb.Digest
+	for _, k := range rsp.GetMissing() {
+		missing = append(missing, &repb.Digest{
+			Hash:      k.GetKey(),
+			SizeBytes: k.GetSizeBytes(),
+		})
 	}
-	return resultMap, nil
+	return missing, nil
 }
 
 func (c *CacheProxy) RemoteGetMulti(ctx context.Context, peer string, isolation *dcpb.Isolation, digests []*repb.Digest) (map[*repb.Digest][]byte, error) {

@@ -6,6 +6,7 @@ go_library(
     importpath = "github.com/buildbuddy-io/buildbuddy/enterprise/server/remote_execution/executor",
     visibility = ["//visibility:public"],
     deps = [
+        "//enterprise/server/auth",
         "//enterprise/server/remote_execution/container",
         "//enterprise/server/remote_execution/containers/firecracker",
         "//enterprise/server/remote_execution/dirtools",
@@ -43,6 +44,7 @@ go_test(
     deps = [
         "//proto:remote_execution_go_proto",
         "//server/testutil/testenv",
+        "//server/testutil/testfs",
         "//server/util/testing/flags",
         "@com_github_stretchr_testify//assert",
         "@org_golang_google_grpc//codes",

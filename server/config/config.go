@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/buildbuddy-io/buildbuddy/server/util/alert"
+	"github.com/buildbuddy-io/buildbuddy/server/util/flagutil"
 	"gopkg.in/yaml.v2"
 
 	"github.com/buildbuddy-io/buildbuddy/server/util/log"
@@ -140,11 +141,17 @@ type AzureConfig struct {
 }
 
 type integrationsConfig struct {
-	Slack SlackConfig `yaml:"slack"`
+	Slack            SlackConfig            `yaml:"slack"`
+	InvocationUpload InvocationUploadConfig `yaml:"invocation_upload"`
 }
 
 type SlackConfig struct {
 	WebhookURL string `yaml:"webhook_url" usage:"A Slack webhook url to post build update messages to."`
+}
+
+type InvocationUploadConfig struct {
+	Enabled            bool   `yaml:"enabled" usage:"Whether to upload webhook data to the webhook URL configured per-Group. ** Enterprise only **"`
+	GCSCredentialsJSON string `yaml:"gcs_credentials" usage:"Credentials JSON for the Google service account used to authenticate when GCS is used as the invocation upload target. ** Enterprise only **"`
 }
 
 type GCSCacheConfig struct {
@@ -206,6 +213,7 @@ type authConfig struct {
 	OauthProviders       []OauthProvider `yaml:"oauth_providers"`
 	EnableAnonymousUsage bool            `yaml:"enable_anonymous_usage" usage:"If true, unauthenticated build uploads will still be allowed but won't be associated with your organization."`
 	SAMLConfig           SAMLConfig      `yaml:"saml" usage:"Configuration for setting up SAML auth support."`
+	EnableSelfAuth       bool            `yaml:"enable_self_auth" usage:"If true, enables a single user login via an oauth provider on the buildbuddy server. Recommend use only when server is behind a firewall; this option may allow anyone with access to the webpage admin rights to your buildbuddy installation. ** Enterprise only **"`
 }
 
 type OauthProvider struct {
@@ -250,6 +258,7 @@ type RemoteExecutionConfig struct {
 
 type ExecutorConfig struct {
 	AppTarget                 string                    `yaml:"app_target" usage:"The GRPC url of a buildbuddy app server."`
+	Pool                      string                    `yaml:"pool" usage:"Executor pool name. Only one of this config option or the MY_POOL environment variable should be specified."`
 	RootDirectory             string                    `yaml:"root_directory" usage:"The root directory to use for build files."`
 	LocalCacheDirectory       string                    `yaml:"local_cache_directory" usage:"A local on-disk cache directory. Must be on the same device (disk partition, Docker volume, etc.) as the configured root_directory, since files are hard-linked to this cache for performance reasons. Otherwise, 'Invalid cross-device link' errors may result."`
 	LocalCacheSizeBytes       int64                     `yaml:"local_cache_size_bytes" usage:"The maximum size, in bytes, to use for the local on-disk cache"`
@@ -267,9 +276,13 @@ type ExecutorConfig struct {
 	EnableFirecracker         bool                      `yaml:"enable_firecracker" usage:"Enables running execution commands inside of firecracker VMs"`
 	HostExecutorRootDirectory string                    `yaml:"host_executor_root_directory" usage:"Path on the host where the executor container root directory is mounted."`
 	ContainerRegistries       []ContainerRegistryConfig `yaml:"container_registries"`
-	EnableCASFS               bool                      `yaml:"enable_casfs" usage:"Whether FUSE based CAS filesystem is enabled."`
+	EnableVFS                 bool                      `yaml:"enable_vfs" usage:"Whether FUSE based filesystem is enabled."`
 	DefaultImage              string                    `yaml:"default_image" usage:"The default docker image to use to warm up executors or if no platform property is set. Ex: gcr.io/flame-public/executor-docker-default:enterprise-v1.5.4"`
 	WarmupTimeoutSecs         int64                     `yaml:"warmup_timeout_secs" usage:"The default time (in seconds) to wait for an executor to warm up i.e. download the default docker image. Default is 120s"`
+	StartupWarmupMaxWaitSecs  int64                     `yaml:"startup_warmup_max_wait_secs" usage:"Maximum time to block startup while waiting for default image to be pulled. Default is no wait."`
+	ExclusiveTaskScheduling   bool                      `yaml:"exclusive_task_scheduling" usage:"If true, only one task will be scheduled at a time. Default is false"`
+	MemoryBytes               int64                     `yaml:"memory_bytes" usage:"Optional maximum memory to allocate to execution tasks (approximate). Cannot set both this option and the SYS_MEMORY_BYTES env var."`
+	MilliCPU                  int64                     `yaml:"millicpu" usage:"Optional maximum CPU milliseconds to allocate to execution tasks (approximate). Cannot set both this option and the SYS_MILLICPU env var."`
 }
 
 type ContainerRegistryConfig struct {
@@ -338,22 +351,6 @@ type OrgConfig struct {
 
 var sharedGeneralConfig generalConfig
 
-type stringSliceFlag []string
-
-func (i *stringSliceFlag) String() string {
-	return strings.Join(*i, ",")
-}
-
-// NOTE: string slice flags are *appended* to the values in the YAML,
-// instead of overriding them completely.
-
-func (i *stringSliceFlag) Set(values string) error {
-	for _, val := range strings.Split(values, ",") {
-		*i = append(*i, val)
-	}
-	return nil
-}
-
 type structSliceFlag struct {
 	dstSlice   reflect.Value
 	structType reflect.Type
@@ -411,8 +408,10 @@ func defineFlagsForMembers(parentStructNames []string, T reflect.Value) {
 			flag.Float64Var(f.Addr().Interface().(*float64), fqFieldName, f.Float(), docString)
 		case reflect.Slice:
 			if f.Type().Elem().Kind() == reflect.String {
+				// NOTE: string slice flags are *appended* to the values in the YAML,
+				// instead of overriding them completely.
 				if slice, ok := f.Interface().([]string); ok {
-					sf := stringSliceFlag(slice)
+					sf := flagutil.StringSliceFlag(slice)
 					flag.Var(&sf, fqFieldName, docString)
 				}
 				continue
@@ -476,8 +475,7 @@ func readConfig(fullConfigPath string) (*generalConfig, error) {
 }
 
 type Configurator struct {
-	gc             *generalConfig
-	fullConfigPath string
+	gc *generalConfig
 }
 
 func NewConfigurator(configFilePath string) (*Configurator, error) {
@@ -486,8 +484,7 @@ func NewConfigurator(configFilePath string) (*Configurator, error) {
 		return nil, err
 	}
 	return &Configurator{
-		fullConfigPath: configFilePath,
-		gc:             conf,
+		gc: conf,
 	}, nil
 }
 
@@ -646,6 +643,10 @@ func (c *Configurator) GetIntegrationsSlackConfig() *SlackConfig {
 	return &c.gc.Integrations.Slack
 }
 
+func (c *Configurator) GetIntegrationsInvocationUploadConfig() *InvocationUploadConfig {
+	return &c.gc.Integrations.InvocationUpload
+}
+
 func (c *Configurator) GetBuildEventProxyHosts() []string {
 	return c.gc.BuildEventProxy.Hosts
 }
@@ -710,7 +711,12 @@ func (c *Configurator) GetCacheInMemory() bool {
 }
 
 func (c *Configurator) GetAnonymousUsageEnabled() bool {
-	return len(c.gc.Auth.OauthProviders) == 0 || c.gc.Auth.EnableAnonymousUsage
+	numOauthProviders := len(c.gc.Auth.OauthProviders)
+	if c.GetSelfAuthEnabled() {
+		// SelfAuth is considered an Oauth Provider
+		numOauthProviders++
+	}
+	return numOauthProviders == 0 || c.gc.Auth.EnableAnonymousUsage
 }
 
 func (c *Configurator) GetAuthJWTKey() string {
@@ -733,6 +739,10 @@ func (c *Configurator) GetAuthAPIKeyGroupCacheTTL() string {
 
 func (c *Configurator) GetSAMLConfig() *SAMLConfig {
 	return &c.gc.Auth.SAMLConfig
+}
+
+func (c *Configurator) GetSelfAuthEnabled() bool {
+	return c.gc.Auth.EnableSelfAuth
 }
 
 func (c *Configurator) GetSSLConfig() *SSLConfig {

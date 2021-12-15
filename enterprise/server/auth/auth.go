@@ -20,8 +20,9 @@ import (
 	"github.com/buildbuddy-io/buildbuddy/server/util/log"
 	"github.com/buildbuddy-io/buildbuddy/server/util/lru"
 	"github.com/buildbuddy-io/buildbuddy/server/util/random"
+	"github.com/buildbuddy-io/buildbuddy/server/util/request_context"
+	"github.com/buildbuddy-io/buildbuddy/server/util/role"
 	"github.com/buildbuddy-io/buildbuddy/server/util/status"
-	"github.com/buildbuddy-io/buildbuddy/server/util/timeutil"
 	"github.com/dgrijalva/jwt-go"
 	"golang.org/x/oauth2"
 	"google.golang.org/grpc/credentials"
@@ -29,7 +30,7 @@ import (
 	"google.golang.org/grpc/peer"
 
 	akpb "github.com/buildbuddy-io/buildbuddy/proto/api_key"
-	requestcontext "github.com/buildbuddy-io/buildbuddy/server/util/request_context"
+	grpb "github.com/buildbuddy-io/buildbuddy/proto/group"
 	oidc "github.com/coreos/go-oidc"
 )
 
@@ -88,7 +89,7 @@ const (
 
 var (
 	authCodeOption []oauth2.AuthCodeOption = []oauth2.AuthCodeOption{oauth2.AccessTypeOffline, oauth2.ApprovalForce}
-	apiKeyRegex                            = regexp.MustCompile(APIKeyHeader + "=([a-zA-Z0-9]+)")
+	apiKeyRegex                            = regexp.MustCompile(APIKeyHeader + "=([a-zA-Z0-9]*)")
 	jwtKey                                 = []byte("set_the_jwt_in_config") // set via config.
 )
 
@@ -98,11 +99,13 @@ func jwtKeyFunc(token *jwt.Token) (interface{}, error) {
 
 type Claims struct {
 	jwt.StandardClaims
-	UserID                 string                   `json:"user_id"`
-	GroupID                string                   `json:"group_id"`
-	AllowedGroups          []string                 `json:"allowed_groups"`
-	Capabilities           []akpb.ApiKey_Capability `json:"capabilities"`
-	UseGroupOwnedExecutors bool                     `json:"use_group_owned_executors,omitempty"`
+	UserID  string `json:"user_id"`
+	GroupID string `json:"group_id"`
+	// TODO(bduffany): remove this field
+	AllowedGroups          []string                      `json:"allowed_groups"`
+	GroupMemberships       []*interfaces.GroupMembership `json:"group_memberships"`
+	Capabilities           []akpb.ApiKey_Capability      `json:"capabilities"`
+	UseGroupOwnedExecutors bool                          `json:"use_group_owned_executors,omitempty"`
 }
 
 func (c *Claims) GetUserID() string {
@@ -115,6 +118,10 @@ func (c *Claims) GetGroupID() string {
 
 func (c *Claims) GetAllowedGroups() []string {
 	return c.AllowedGroups
+}
+
+func (c *Claims) GetGroupMemberships() []*interfaces.GroupMembership {
+	return c.GroupMemberships
 }
 
 func (c *Claims) IsAdmin() bool {
@@ -217,11 +224,13 @@ type authenticator interface {
 }
 
 type oidcAuthenticator struct {
-	oauth2Config *oauth2.Config
-	oidcConfig   *oidc.Config
-	provider     *oidc.Provider
-	issuer       string
-	slug         string
+	oauth2Config       func() (*oauth2.Config, error)
+	cachedOauth2Config *oauth2.Config
+	oidcConfig         *oidc.Config
+	cachedProvider     *oidc.Provider
+	provider           func() (*oidc.Provider, error)
+	issuer             string
+	slug               string
 }
 
 func extractToken(issuer, slug string, idToken *oidc.IDToken) (*userToken, error) {
@@ -244,17 +253,29 @@ func (a *oidcAuthenticator) getSlug() string {
 }
 
 func (a *oidcAuthenticator) authCodeURL(state string, opts ...oauth2.AuthCodeOption) string {
-	return a.oauth2Config.AuthCodeURL(state, opts...)
+	oauth2Config, err := a.oauth2Config()
+	if err != nil {
+		return ""
+	}
+	return oauth2Config.AuthCodeURL(state, opts...)
 }
 
 func (a *oidcAuthenticator) exchange(ctx context.Context, code string, opts ...oauth2.AuthCodeOption) (*oauth2.Token, error) {
-	return a.oauth2Config.Exchange(ctx, code, opts...)
+	oauth2Config, err := a.oauth2Config()
+	if err != nil {
+		return nil, err
+	}
+	return oauth2Config.Exchange(ctx, code, opts...)
 }
 
 func (a *oidcAuthenticator) verifyTokenAndExtractUser(ctx context.Context, jwt string, checkExpiry bool) (*userToken, error) {
 	conf := a.oidcConfig
 	conf.SkipExpiryCheck = !checkExpiry
-	validToken, err := a.provider.Verifier(conf).Verify(ctx, jwt)
+	provider, err := a.provider()
+	if err != nil {
+		return nil, err
+	}
+	validToken, err := provider.Verifier(conf).Verify(ctx, jwt)
 	if err != nil {
 		return nil, err
 	}
@@ -262,7 +283,11 @@ func (a *oidcAuthenticator) verifyTokenAndExtractUser(ctx context.Context, jwt s
 }
 
 func (a *oidcAuthenticator) renewToken(ctx context.Context, refreshToken string) (*oauth2.Token, error) {
-	src := a.oauth2Config.TokenSource(ctx, &oauth2.Token{RefreshToken: refreshToken})
+	oauth2Config, err := a.oauth2Config()
+	if err != nil {
+		return nil, err
+	}
+	src := oauth2Config.TokenSource(ctx, &oauth2.Token{RefreshToken: refreshToken})
 	return src.Token() // this actually renews the token
 }
 
@@ -339,30 +364,62 @@ type OpenIDAuthenticator struct {
 func createAuthenticatorsFromConfig(ctx context.Context, authConfigs []config.OauthProvider, authURL *url.URL) ([]authenticator, error) {
 	var authenticators []authenticator
 	for _, authConfig := range authConfigs {
-		provider, err := oidc.NewProvider(ctx, authConfig.IssuerURL)
-		if err != nil {
-			return nil, err
-		}
+		// declare local var that shadows loop var for closure capture
+		authConfig := authConfig
 		oidcConfig := &oidc.Config{
 			ClientID:        authConfig.ClientID,
 			SkipExpiryCheck: false,
 		}
-		// Configure an OpenID Connect aware OAuth2 client.
-		oauth2Config := &oauth2.Config{
-			ClientID:     authConfig.ClientID,
-			ClientSecret: authConfig.ClientSecret,
-			RedirectURL:  authURL.String(),
-			Endpoint:     provider.Endpoint(),
-			// "openid" is a required scope for OpenID Connect flows.
-			Scopes: []string{oidc.ScopeOpenID, "profile", "email"},
+		authenticator := &oidcAuthenticator{
+			slug:       authConfig.Slug,
+			issuer:     authConfig.IssuerURL,
+			oidcConfig: oidcConfig,
 		}
-		authenticators = append(authenticators, &oidcAuthenticator{
-			slug:         authConfig.Slug,
-			issuer:       authConfig.IssuerURL,
-			oauth2Config: oauth2Config,
-			oidcConfig:   oidcConfig,
-			provider:     provider,
-		})
+
+		// initialize provider and oauth2Config.Endpoint on-demand, since our self oauth provider won't be reachable until the server starts
+		var oauth2ConfigMutex sync.Mutex
+		authenticator.oauth2Config = func() (*oauth2.Config, error) {
+			oauth2ConfigMutex.Lock()
+			defer oauth2ConfigMutex.Unlock()
+			var err error
+			if authenticator.cachedOauth2Config == nil {
+				var provider *oidc.Provider
+				if provider, err = authenticator.provider(); err == nil {
+					// "openid" is a required scope for OpenID Connect flows.
+					scopes := []string{oidc.ScopeOpenID, "profile", "email"}
+					// Google reject the offline_access scope in favor of access_type=offline url param which already gets
+					// set in our auth flow thanks to the oauth2.AccessTypeOffline authCodeOption at the top of this file.
+					// https://github.com/coreos/go-oidc/blob/v2.2.1/oidc.go#L30
+					if authConfig.IssuerURL != "https://accounts.google.com" {
+						scopes = append(scopes, oidc.ScopeOfflineAccess)
+					}
+					// Configure an OpenID Connect aware OAuth2 client.
+					authenticator.cachedOauth2Config = &oauth2.Config{
+						ClientID:     authConfig.ClientID,
+						ClientSecret: authConfig.ClientSecret,
+						RedirectURL:  authURL.String(),
+						Endpoint:     provider.Endpoint(),
+						Scopes:       scopes,
+					}
+				}
+			}
+			return authenticator.cachedOauth2Config, err
+		}
+
+		var providerMutex sync.Mutex
+		authenticator.provider = func() (*oidc.Provider, error) {
+			providerMutex.Lock()
+			defer providerMutex.Unlock()
+			var err error
+			if authenticator.cachedProvider == nil {
+				if authenticator.cachedProvider, err = oidc.NewProvider(ctx, authConfig.IssuerURL); err != nil {
+					log.Errorf("Error Initializing auth: %v", err)
+				}
+			}
+			return authenticator.cachedProvider, err
+		}
+
+		authenticators = append(authenticators, authenticator)
 	}
 	return authenticators, nil
 }
@@ -409,8 +466,7 @@ func newForTesting(ctx context.Context, env environment.Env, testAuthenticator a
 	return oia, nil
 }
 
-func NewOpenIDAuthenticator(ctx context.Context, env environment.Env) (*OpenIDAuthenticator, error) {
-	authConfigs := env.GetConfigurator().GetAuthOauthProviders()
+func NewOpenIDAuthenticator(ctx context.Context, env environment.Env, authConfigs []config.OauthProvider) (*OpenIDAuthenticator, error) {
 	if len(authConfigs) == 0 {
 		return nil, status.FailedPreconditionErrorf("No auth providers specified in config!")
 	}
@@ -472,19 +528,46 @@ func lookupUserFromSubID(env environment.Env, ctx context.Context, subID string)
 		if err := userRow.Take(user).Error; err != nil {
 			return err
 		}
-		groupRows, err := tx.Raw(`SELECT g.* FROM `+"`Groups`"+` as g JOIN UserGroups as ug
-                                          ON g.group_id = ug.group_group_id
-                                          WHERE ug.user_user_id = ?`, user.UserID).Rows()
+		groupRows, err := tx.Raw(`
+			SELECT
+				g.user_id,
+				g.group_id,
+				g.url_identifier,
+				g.name,
+				g.owned_domain,
+				g.github_token,
+				g.sharing_enabled,
+				g.use_group_owned_executors,
+				g.saml_idp_metadata_url,
+				ug.role
+			FROM `+"`Groups`"+` AS g, UserGroups AS ug
+			WHERE g.group_id = ug.group_group_id
+			AND ug.membership_status = ?
+			AND ug.user_user_id = ?
+			`, int32(grpb.GroupMembershipStatus_MEMBER), user.UserID,
+		).Rows()
 		if err != nil {
 			return err
 		}
 		defer groupRows.Close()
 		for groupRows.Next() {
-			g := &tables.Group{}
-			if err := tx.ScanRows(groupRows, g); err != nil {
+			gr := &tables.GroupRole{}
+			err := groupRows.Scan(
+				&gr.Group.UserID,
+				&gr.Group.GroupID,
+				&gr.Group.URLIdentifier,
+				&gr.Group.Name,
+				&gr.Group.OwnedDomain,
+				&gr.Group.GithubToken,
+				&gr.Group.SharingEnabled,
+				&gr.Group.UseGroupOwnedExecutors,
+				&gr.Group.SamlIdpMetadataUrl,
+				&gr.Role,
+			)
+			if err != nil {
 				return err
 			}
-			user.Groups = append(user.Groups, g)
+			user.Groups = append(user.Groups, gr)
 		}
 		return nil
 	})
@@ -492,6 +575,9 @@ func lookupUserFromSubID(env environment.Env, ctx context.Context, subID string)
 }
 
 func (a *OpenIDAuthenticator) lookupAPIKeyGroupFromAPIKey(ctx context.Context, apiKey string) (interfaces.APIKeyGroup, error) {
+	if apiKey == "" {
+		return nil, status.UnauthenticatedError("missing API key")
+	}
 	if a.apiKeyGroupCache != nil {
 		d, ok := a.apiKeyGroupCache.Get(apiKey)
 		if ok {
@@ -509,21 +595,32 @@ func (a *OpenIDAuthenticator) lookupAPIKeyGroupFromAPIKey(ctx context.Context, a
 	return apkg, err
 }
 
-func userClaims(u *tables.User) *Claims {
-	var allowedGroups []string
+func userClaims(u *tables.User, effectiveGroup string) *Claims {
+	allowedGroups := make([]string, 0, len(u.Groups))
+	groupMemberships := make([]*interfaces.GroupMembership, 0, len(u.Groups))
 	for _, g := range u.Groups {
-		allowedGroups = append(allowedGroups, g.GroupID)
+		allowedGroups = append(allowedGroups, g.Group.GroupID)
+		groupMemberships = append(groupMemberships, &interfaces.GroupMembership{
+			GroupID: g.Group.GroupID,
+			Role:    role.Role(g.Role),
+		})
 	}
 	return &Claims{
-		UserID:        u.UserID,
-		AllowedGroups: allowedGroups,
+		UserID:           u.UserID,
+		GroupMemberships: groupMemberships,
+		AllowedGroups:    allowedGroups,
+		GroupID:          effectiveGroup,
 	}
 }
 
 func groupClaims(akg interfaces.APIKeyGroup) *Claims {
 	return &Claims{
-		GroupID:                akg.GetGroupID(),
-		AllowedGroups:          []string{akg.GetGroupID()},
+		GroupID:       akg.GetGroupID(),
+		AllowedGroups: []string{akg.GetGroupID()},
+		// For now, API keys are assigned the default role.
+		GroupMemberships: []*interfaces.GroupMembership{
+			{GroupID: akg.GetGroupID(), Role: role.Default},
+		},
 		Capabilities:           capabilities.FromInt(akg.GetCapabilities()),
 		UseGroupOwnedExecutors: akg.GetUseGroupOwnedExecutors(),
 	}
@@ -550,12 +647,19 @@ func authContextFromClaims(ctx context.Context, claims *Claims, err error) conte
 	return ctx
 }
 
-func (a *OpenIDAuthenticator) ParseAPIKeyFromString(input string) string {
+func (a *OpenIDAuthenticator) ParseAPIKeyFromString(input string) (string, error) {
 	matches := apiKeyRegex.FindStringSubmatch(input)
-	if matches != nil && len(matches) > 1 {
-		return matches[1]
+	if len(matches) == 0 {
+		// The api key header is not present
+		return "", nil
 	}
-	return ""
+	if len(matches) != 2 {
+		return "", status.UnauthenticatedError("failed to parse API key: invalid input")
+	}
+	if apiKey := matches[1]; apiKey != "" {
+		return apiKey, nil
+	}
+	return "", status.UnauthenticatedError("failed to parse API key: missing API Key")
 }
 
 func (a *OpenIDAuthenticator) AuthContextFromAPIKey(ctx context.Context, apiKey string) context.Context {
@@ -565,6 +669,18 @@ func (a *OpenIDAuthenticator) AuthContextFromAPIKey(ctx context.Context, apiKey 
 	ctx = context.WithValue(ctx, APIKeyHeader, apiKey)
 	claims, err := a.claimsFromAPIKey(ctx, apiKey)
 	return authContextFromClaims(ctx, claims, err)
+}
+
+func (a *OpenIDAuthenticator) TrustedJWTFromAuthContext(ctx context.Context) string {
+	jwt, ok := ctx.Value(contextTokenStringKey).(string)
+	if !ok {
+		return ""
+	}
+	return jwt
+}
+
+func (a *OpenIDAuthenticator) AuthContextFromTrustedJWT(ctx context.Context, jwt string) context.Context {
+	return context.WithValue(ctx, contextTokenStringKey, jwt)
 }
 
 func (a *OpenIDAuthenticator) claimsFromAPIKey(ctx context.Context, apiKey string) (*Claims, error) {
@@ -592,7 +708,15 @@ func ClaimsFromSubID(env environment.Env, ctx context.Context, subID string) (*C
 	if err != nil {
 		return nil, err
 	}
-	return userClaims(u), nil
+	eg := ""
+	if c := requestcontext.ProtoRequestContextFromContext(ctx); c != nil && c.GetGroupId() != "" {
+		for _, g := range u.Groups {
+			if g.Group.GroupID == c.GetGroupId() {
+				eg = c.GetGroupId()
+			}
+		}
+	}
+	return userClaims(u, eg), nil
 }
 
 func (a *OpenIDAuthenticator) claimsFromAuthorityString(ctx context.Context, authority string) (*Claims, error) {
@@ -666,26 +790,7 @@ func (a *OpenIDAuthenticator) AuthenticatedHTTPContext(w http.ResponseWriter, r 
 	if err != nil {
 		return authContextWithError(ctx, err)
 	}
-	err = a.authenticateGroup(ctx, claims)
-	if err != nil {
-		return authContextWithError(ctx, err)
-	}
 	return authContextFromClaims(ctx, claims, err)
-}
-
-func (a *OpenIDAuthenticator) authenticateGroup(ctx context.Context, claims *Claims) error {
-	reqCtx := requestcontext.ProtoRequestContextFromContext(ctx)
-	// If no group ID was provided in context then we'll fall back to a default.
-	if reqCtx == nil || reqCtx.GetGroupId() == "" {
-		return nil
-	}
-	groupID := reqCtx.GetGroupId()
-	for _, allowedGroupID := range claims.GetAllowedGroups() {
-		if groupID == allowedGroupID {
-			return nil
-		}
-	}
-	return status.PermissionDeniedError("User does not have access to the requested group.")
 }
 
 func (a *OpenIDAuthenticator) authenticateUser(w http.ResponseWriter, r *http.Request) (*Claims, *userToken, error) {
@@ -750,8 +855,12 @@ func (a *OpenIDAuthenticator) authenticatedUser(ctx context.Context) (*Claims, e
 		}
 		return claims, nil
 	}
+	msg := "User not found"
+	if err, ok := ctx.Value(contextUserErrorKey).(error); ok && err != nil {
+		msg += ": " + err.Error()
+	}
 	// WARNING: app/auth/auth_service.ts depends on this status being UNAUTHENTICATED.
-	return nil, status.UnauthenticatedError("User not found")
+	return nil, status.UnauthenticatedError(msg)
 }
 
 func (a *OpenIDAuthenticator) AuthenticatedUser(ctx context.Context) (interfaces.UserInfo, error) {
@@ -783,7 +892,9 @@ func (a *OpenIDAuthenticator) FillUser(ctx context.Context, user *tables.User) e
 	user.Email = t.Email
 	user.ImageURL = t.Picture
 	if t.slug != "" {
-		user.Groups = []*tables.Group{{URLIdentifier: &t.slug}}
+		user.Groups = []*tables.GroupRole{
+			{Group: tables.Group{URLIdentifier: &t.slug}},
+		}
 	}
 	return nil
 }
@@ -894,7 +1005,7 @@ func (a *OpenIDAuthenticator) Auth(w http.ResponseWriter, r *http.Request) {
 			SubID:        ut.GetSubID(),
 			AccessToken:  oauth2Token.AccessToken,
 			RefreshToken: refreshToken,
-			ExpiryUsec:   timeutil.ToUsec(expireTime),
+			ExpiryUsec:   expireTime.UnixMicro(),
 		}
 		if authDB := a.env.GetAuthDB(); authDB != nil {
 			if err := authDB.InsertOrUpdateUserToken(ctx, ut.GetSubID(), tt); err != nil {

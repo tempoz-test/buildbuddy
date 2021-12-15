@@ -109,9 +109,9 @@ func update(old, new map[string]bool) {
 	}
 }
 
-func (c *Cache) ContainsMulti(ctx context.Context, digests []*repb.Digest) (map[*repb.Digest]bool, error) {
-	lock := sync.RWMutex{} // protects(foundMap)
-	foundMap := make(map[*repb.Digest]bool, len(digests))
+func (c *Cache) FindMissing(ctx context.Context, digests []*repb.Digest) ([]*repb.Digest, error) {
+	lock := sync.RWMutex{} // protects(missing)
+	var missing []*repb.Digest
 	eg, ctx := errgroup.WithContext(ctx)
 
 	for _, d := range digests {
@@ -121,9 +121,11 @@ func (c *Cache) ContainsMulti(ctx context.Context, digests []*repb.Digest) (map[
 				if err != nil {
 					return err
 				}
-				lock.Lock()
-				defer lock.Unlock()
-				foundMap[d] = exists
+				if !exists {
+					lock.Lock()
+					defer lock.Unlock()
+					missing = append(missing, d)
+				}
 				return nil
 			})
 		}
@@ -134,7 +136,7 @@ func (c *Cache) ContainsMulti(ctx context.Context, digests []*repb.Digest) (map[
 		return nil, err
 	}
 
-	return foundMap, nil
+	return missing, nil
 }
 
 func (c *Cache) Get(ctx context.Context, d *repb.Digest) ([]byte, error) {

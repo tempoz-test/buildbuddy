@@ -14,13 +14,14 @@ import (
 	"github.com/buildbuddy-io/buildbuddy/server/backends/github"
 	"github.com/buildbuddy-io/buildbuddy/server/backends/invocationdb"
 	"github.com/buildbuddy-io/buildbuddy/server/backends/memory_cache"
-	"github.com/buildbuddy-io/buildbuddy/server/backends/memory_key_val_store"
+	"github.com/buildbuddy-io/buildbuddy/server/backends/memory_kvstore"
 	"github.com/buildbuddy-io/buildbuddy/server/backends/memory_metrics_collector"
 	"github.com/buildbuddy-io/buildbuddy/server/backends/repo_downloader"
 	"github.com/buildbuddy-io/buildbuddy/server/backends/slack"
 	"github.com/buildbuddy-io/buildbuddy/server/build_event_protocol/build_event_handler"
 	"github.com/buildbuddy-io/buildbuddy/server/build_event_protocol/build_event_proxy"
 	"github.com/buildbuddy-io/buildbuddy/server/build_event_protocol/build_event_server"
+	"github.com/buildbuddy-io/buildbuddy/server/build_event_protocol/webhooks"
 	"github.com/buildbuddy-io/buildbuddy/server/buildbuddy_server"
 	"github.com/buildbuddy-io/buildbuddy/server/config"
 	"github.com/buildbuddy-io/buildbuddy/server/environment"
@@ -38,6 +39,7 @@ import (
 	"github.com/buildbuddy-io/buildbuddy/server/ssl"
 	"github.com/buildbuddy-io/buildbuddy/server/static"
 	"github.com/buildbuddy-io/buildbuddy/server/util/db"
+	"github.com/buildbuddy-io/buildbuddy/server/util/fileresolver"
 	"github.com/buildbuddy-io/buildbuddy/server/util/grpc_server"
 	"github.com/buildbuddy-io/buildbuddy/server/util/healthcheck"
 	"github.com/buildbuddy-io/buildbuddy/server/util/log"
@@ -109,11 +111,12 @@ func configureFilesystemsOrDie(realEnv *real_environment.RealEnv) {
 		}
 		realEnv.SetAppFilesystem(appFS)
 	}
+	bundleFS, err := bundle.Get()
+	if err != nil {
+		log.Fatalf("Error getting bundle FS: %s", err)
+	}
+	realEnv.SetFileResolver(fileresolver.New(bundleFS, ""))
 	if realEnv.GetStaticFilesystem() == nil || realEnv.GetAppFilesystem() == nil {
-		bundleFS, err := bundle.Get()
-		if err != nil {
-			log.Fatalf("Error getting bundle FS: %s", err)
-		}
 		if realEnv.GetStaticFilesystem() == nil {
 			staticFS, err := fs.Sub(bundleFS, "static")
 			if err != nil {
@@ -159,20 +162,24 @@ func GetConfiguredEnvironmentOrDie(configurator *config.Configurator, healthChec
 	}
 
 	realEnv := real_environment.NewRealEnv(configurator, healthChecker)
+	realEnv.SetMux(tracing.NewHttpServeMux(http.NewServeMux()))
 	configureFilesystemsOrDie(realEnv)
 	realEnv.SetDBHandle(dbHandle)
 	realEnv.SetBlobstore(bs)
 	realEnv.SetInvocationDB(invocationdb.NewInvocationDB(realEnv, dbHandle))
 	realEnv.SetAuthenticator(&nullauth.NullAuthenticator{})
 
-	webhooks := make([]interfaces.Webhook, 0)
+	hooks := make([]interfaces.Webhook, 0)
 	appURL := configurator.GetAppBuildBuddyURL()
 	if sc := configurator.GetIntegrationsSlackConfig(); sc != nil {
 		if sc.WebhookURL != "" {
-			webhooks = append(webhooks, slack.NewSlackWebhook(sc.WebhookURL, appURL))
+			hooks = append(hooks, slack.NewSlackWebhook(sc.WebhookURL, appURL))
 		}
 	}
-	realEnv.SetWebhooks(webhooks)
+	if configurator.GetIntegrationsInvocationUploadConfig().Enabled {
+		hooks = append(hooks, webhooks.NewInvocationUploadHook(realEnv))
+	}
+	realEnv.SetWebhooks(hooks)
 
 	buildEventProxyClients := make([]pepb.PublishBuildEventClient, 0)
 	for _, target := range configurator.GetBuildEventProxyHosts() {
@@ -217,7 +224,7 @@ func GetConfiguredEnvironmentOrDie(configurator *config.Configurator, healthChec
 	}
 	realEnv.SetMetricsCollector(collector)
 
-	keyValStore, err := memory_key_val_store.NewMemoryKeyValStore()
+	keyValStore, err := memory_kvstore.NewMemoryKeyValStore()
 	if err != nil {
 		log.Fatalf("Error configuring in-memory proto store: %s", err.Error())
 	}
@@ -379,7 +386,7 @@ func StartAndRunServices(env environment.Env) {
 		StartGRPCServiceOrDie(env, buildBuddyServer, gRPCSPort, grpc.Creds(creds))
 	}
 
-	mux := tracing.NewHttpServeMux(http.NewServeMux())
+	mux := env.GetMux()
 	// Register all of our HTTP handlers on the default mux.
 	mux.Handle("/", httpfilters.WrapExternalHandler(env, staticFileServer))
 	mux.Handle("/app/", httpfilters.WrapExternalHandler(env, http.StripPrefix("/app", afs)))

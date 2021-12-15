@@ -1,7 +1,7 @@
 load("@io_bazel_rules_go//go:def.bzl", "go_binary", "go_library")
 
 go_library(
-    name = "cas",
+    name = "cas_lib",
     srcs = ["cas.go"],
     importpath = "github.com/buildbuddy-io/buildbuddy/tools/cas",
     visibility = ["//visibility:private"],
@@ -18,7 +18,7 @@ go_library(
 )
 
 go_binary(
-    name = "main",
-    embed = [":cas"],
+    name = "cas",
+    embed = [":cas_lib"],
     visibility = ["//visibility:public"],
 )

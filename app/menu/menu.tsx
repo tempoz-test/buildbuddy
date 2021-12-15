@@ -3,6 +3,7 @@ import authService, { User } from "../auth/auth_service";
 import capabilities from "../capabilities/capabilities";
 import router, { Path } from "../router/router";
 import UserPreferences from "../preferences/preferences";
+import { Menu } from "lucide-react";
 
 interface Props {
   children?: any;
@@ -60,6 +61,7 @@ export default class MenuComponent extends React.Component {
   private gitHubLinkUrl(): string {
     const params = new URLSearchParams({
       group_id: this.props.user?.selectedGroup?.id,
+      user_id: this.props.user?.displayUser.userId.id,
       redirect_url: window.location.href,
     });
     return `/auth/github/link/?${params}`;
@@ -81,7 +83,7 @@ export default class MenuComponent extends React.Component {
               </a>
             </div>
             {this.props.showHamburger && (!capabilities.auth || !this.props.user) && (
-              <img onClick={this.handleMenuClicked.bind(this)} className="icon" src="/image/menu.svg" />
+              <Menu onClick={this.handleMenuClicked.bind(this)} className="icon white" />
             )}
             {this.props.showHamburger && capabilities.auth && this.props.user && (
               <img

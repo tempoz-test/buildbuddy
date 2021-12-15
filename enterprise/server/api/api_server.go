@@ -16,11 +16,11 @@ import (
 	"github.com/buildbuddy-io/buildbuddy/server/environment"
 	"github.com/buildbuddy-io/buildbuddy/server/http/protolet"
 	"github.com/buildbuddy-io/buildbuddy/server/interfaces"
+	"github.com/buildbuddy-io/buildbuddy/server/remote_cache/digest"
 	"github.com/buildbuddy-io/buildbuddy/server/tables"
 	"github.com/buildbuddy-io/buildbuddy/server/util/perms"
 	"github.com/buildbuddy-io/buildbuddy/server/util/query_builder"
 	"github.com/buildbuddy-io/buildbuddy/server/util/status"
-	"github.com/buildbuddy-io/buildbuddy/server/util/timeutil"
 	"github.com/golang/protobuf/ptypes"
 
 	apipb "github.com/buildbuddy-io/buildbuddy/proto/api/v1"
@@ -131,7 +131,7 @@ func (s *APIServer) GetTarget(ctx context.Context, req *apipb.GetTargetRequest) 
 	// Filter to only selected targets.
 	targets := []*apipb.Target{}
 	for _, target := range targetMap {
-		if targetMatchesTargetSelector(target.GetId(), req.GetSelector()) {
+		if targetMatchesTargetSelector(target, req.GetSelector()) {
 			targets = append(targets, target)
 		}
 	}
@@ -173,6 +173,26 @@ func (s *APIServer) GetAction(ctx context.Context, req *apipb.GetActionRequest) 
 
 	return &apipb.GetActionResponse{
 		Action: actions,
+	}, nil
+}
+
+func (s *APIServer) GetLog(ctx context.Context, req *apipb.GetLogRequest) (*apipb.GetLogResponse, error) {
+	// No need for user here because user filters will be applied by LookupInvocation.
+	if _, err := s.checkPreconditions(ctx); err != nil {
+		return nil, err
+	}
+
+	if req.GetSelector().GetInvocationId() == "" {
+		return nil, status.InvalidArgumentErrorf("LogSelector must contain a valid invocation_id")
+	}
+
+	inv, err := build_event_handler.LookupInvocation(s.env, ctx, req.GetSelector().GetInvocationId())
+	if err != nil {
+		return nil, err
+	}
+
+	return &apipb.GetLogResponse{
+		Log: &apipb.Log{Contents: inv.ConsoleBuffer},
 	}, nil
 }
 
@@ -251,6 +271,11 @@ func targetMapFromInvocation(inv *invocation.Invocation) map[string]*apipb.Targe
 		switch p := event.BuildEvent.Payload.(type) {
 		case *build_event_stream.BuildEvent_Configured:
 			{
+				ruleType := strings.Replace(p.Configured.TargetKind, " rule", "", -1)
+				language := ""
+				if components := strings.Split(p.Configured.TargetKind, "_"); len(components) > 1 {
+					language = components[0]
+				}
 				label := event.GetBuildEvent().GetId().GetTargetConfigured().GetLabel()
 				targetMap[label] = &apipb.Target{
 					Id: &apipb.Target_Id{
@@ -259,7 +284,8 @@ func targetMapFromInvocation(inv *invocation.Invocation) map[string]*apipb.Targe
 					},
 					Label:    label,
 					Status:   cmnpb.Status_BUILDING,
-					RuleType: strings.Replace(p.Configured.TargetKind, " rule", "", -1),
+					RuleType: ruleType,
+					Language: language,
 					Tag:      p.Configured.Tag,
 				}
 			}
@@ -272,7 +298,7 @@ func targetMapFromInvocation(inv *invocation.Invocation) map[string]*apipb.Targe
 			{
 				target := targetMap[event.GetBuildEvent().GetId().GetTestSummary().GetLabel()]
 				target.Status = testStatusToStatus(p.TestSummary.OverallStatus)
-				startTimeProto, _ := ptypes.TimestampProto(timeutil.FromMillis(p.TestSummary.FirstStartTimeMillis))
+				startTimeProto, _ := ptypes.TimestampProto(time.UnixMilli(p.TestSummary.FirstStartTimeMillis))
 				duration, _ := time.ParseDuration(fmt.Sprintf("%dms", p.TestSummary.TotalRunDurationMillis))
 				durationProto := ptypes.DurationProto(duration)
 				target.Timing = &cmnpb.Timing{
@@ -294,11 +320,17 @@ func filesFromOutput(output []*build_event_stream.File) []*apipb.File {
 			uri = file.Uri
 			// Contents files are not currently supported - only the file name will be appended without a uri.
 		}
-
-		files = append(files, &apipb.File{
+		f := &apipb.File{
 			Name: output.Name,
 			Uri:  uri,
-		})
+		}
+		if u, err := url.Parse(uri); err == nil {
+			if _, d, err := digest.ExtractDigestFromDownloadResourceName(u.Path); err == nil {
+				f.Hash = d.GetHash()
+				f.SizeBytes = d.GetSizeBytes()
+			}
+		}
+		files = append(files, f)
 	}
 	return files
 }
@@ -308,7 +340,7 @@ func fillActionFromBuildEvent(action *apipb.Action, event *build_event_stream.Bu
 	case *build_event_stream.BuildEvent_Completed:
 		{
 			action.Id.TargetId = encodeID(event.GetId().GetTargetCompleted().GetLabel())
-			action.Id.ConfigurationId = event.GetId().GetTargetCompleted().Configuration.Id
+			action.Id.ConfigurationId = event.GetId().GetTargetCompleted().GetConfiguration().Id
 			action.Id.ActionId = encodeID("build")
 			action.File = filesFromOutput(p.Completed.ImportantOutput)
 			return action
@@ -317,7 +349,7 @@ func fillActionFromBuildEvent(action *apipb.Action, event *build_event_stream.Bu
 		{
 			testResultID := event.GetId().GetTestResult()
 			action.Id.TargetId = encodeID(event.GetId().GetTestResult().GetLabel())
-			action.Id.ConfigurationId = event.GetId().GetTestResult().Configuration.Id
+			action.Id.ConfigurationId = event.GetId().GetTestResult().GetConfiguration().Id
 			action.Id.ActionId = encodeID(fmt.Sprintf("test-S_%d-R_%d-A_%d", testResultID.Shard, testResultID.Run, testResultID.Attempt))
 			action.File = filesFromOutput(p.TestResult.TestActionOutput)
 			return action
@@ -326,9 +358,21 @@ func fillActionFromBuildEvent(action *apipb.Action, event *build_event_stream.Bu
 	return nil
 }
 
-// Returns true if a selector has an empty target ID or matches the target's ID
-func targetMatchesTargetSelector(id *apipb.Target_Id, selector *apipb.TargetSelector) bool {
-	return selector.TargetId == "" || selector.TargetId == id.TargetId
+// Returns true if a selector has an empty target ID or matches the target's ID or tag
+func targetMatchesTargetSelector(target *apipb.Target, selector *apipb.TargetSelector) bool {
+	if selector.Label != "" {
+		return selector.Label == target.Label
+	}
+
+	if selector.Tag != "" {
+		for _, tag := range target.GetTag() {
+			if tag == selector.Tag {
+				return true
+			}
+		}
+		return false
+	}
+	return selector.TargetId == "" || selector.TargetId == target.GetId().TargetId
 }
 
 // Returns true if a selector doesn't specify a particular id or matches the target's ID

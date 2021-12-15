@@ -3,13 +3,19 @@ package build_event_handler_test
 import (
 	"context"
 	"fmt"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/buildbuddy-io/buildbuddy/proto/build_event_stream"
+	"github.com/buildbuddy-io/buildbuddy/server/backends/chunkstore"
 	"github.com/buildbuddy-io/buildbuddy/server/build_event_protocol/build_event_handler"
+	"github.com/buildbuddy-io/buildbuddy/server/eventlog"
 	"github.com/buildbuddy-io/buildbuddy/server/tables"
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testauth"
+	"github.com/buildbuddy-io/buildbuddy/server/testutil/testclock"
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testenv"
+	"github.com/buildbuddy-io/buildbuddy/server/util/protofile"
 	"github.com/buildbuddy-io/buildbuddy/server/util/testing/flags"
 	"github.com/golang/protobuf/proto"
 	"github.com/stretchr/testify/assert"
@@ -42,6 +48,19 @@ func progressEvent() *anypb.Any {
 			Progress: &build_event_stream.Progress{
 				Stderr: "stderr",
 				Stdout: "stdout",
+			},
+		},
+	})
+	return progressAny
+}
+
+func progressEventWithOutput(stdout, stderr string) *anypb.Any {
+	progressAny := &anypb.Any{}
+	progressAny.MarshalFrom(&build_event_stream.BuildEvent{
+		Payload: &build_event_stream.BuildEvent_Progress{
+			Progress: &build_event_stream.Progress{
+				Stderr: stderr,
+				Stdout: stdout,
 			},
 		},
 	})
@@ -110,6 +129,18 @@ func structuredCommandLineEvent(env map[string]string) *anypb.Any {
 		},
 	})
 	return commandLineAny
+}
+
+func finishedEvent() *anypb.Any {
+	finishedAny := &anypb.Any{}
+	finishedAny.MarshalFrom(&build_event_stream.BuildEvent{
+		Payload: &build_event_stream.BuildEvent_Finished{
+			Finished: &build_event_stream.BuildFinished{
+				ExitCode: &build_event_stream.BuildFinished_ExitCode{},
+			},
+		},
+	})
+	return finishedAny
 }
 
 func assertAPIKeyRedacted(t *testing.T, invocation *inpb.Invocation, apiKey string) {
@@ -308,6 +339,11 @@ func TestHandleEventWithWorkspaceStatusBeforeStarted(t *testing.T) {
 	err = channel.HandleEvent(request)
 	assert.NoError(t, err)
 
+	// Send started event with api key
+	request = streamRequest(finishedEvent(), "test-invocation-id", 4)
+	err = channel.HandleEvent(request)
+	assert.NoError(t, err)
+
 	// Make sure invocation is only readable by group and has commit sha
 	invocation, err = build_event_handler.LookupInvocation(te, auth.AuthContextFromAPIKey(ctx, "USER1"), "test-invocation-id")
 	assert.NoError(t, err)
@@ -407,4 +443,400 @@ func TestHandleEventWithUsageTracking(t *testing.T) {
 	assert.NoError(t, err)
 
 	assert.Equal(t, int64(1), ut.invocations)
+}
+
+func TestFinishedFinalizeWithCanceledContext(t *testing.T) {
+	te := testenv.GetTestEnv(t)
+	auth := testauth.NewTestAuthenticator(testauth.TestUsers("USER1", "GROUP1"))
+	te.SetAuthenticator(auth)
+	ctx, cancel := context.WithCancel(context.Background())
+
+	handler := build_event_handler.NewBuildEventHandler(te)
+	channel := handler.OpenChannel(ctx, "test-invocation-id")
+
+	// Send started event with api key
+	request := streamRequest(startedEvent("--remote_header='"+testauth.APIKeyHeader+"=USER1'"), "test-invocation-id", 1)
+	err := channel.HandleEvent(request)
+	assert.NoError(t, err)
+
+	// Send workspace status event with commit sha (which causes a flush)
+	request = streamRequest(workspaceStatusEvent("COMMIT_SHA", "abc123"), "test-invocation-id", 2)
+	err = channel.HandleEvent(request)
+	assert.NoError(t, err)
+
+	// Send finished event
+	request = streamRequest(finishedEvent(), "test-invocation-id", 3)
+	err = channel.HandleEvent(request)
+	assert.NoError(t, err)
+
+	// Make sure invocation is only readable by group and has commit sha
+	invocation, err := build_event_handler.LookupInvocation(te, auth.AuthContextFromAPIKey(ctx, "USER1"), "test-invocation-id")
+	assert.NoError(t, err)
+	assert.Equal(t, inpb.InvocationPermission_GROUP, invocation.ReadPermission)
+	assert.Equal(t, "abc123", invocation.CommitSha)
+	assert.Equal(t, inpb.Invocation_PARTIAL_INVOCATION_STATUS, invocation.InvocationStatus)
+
+	// Cancel the context
+	cancel()
+
+	// Finalize the invocation
+	err = channel.FinalizeInvocation("test-invocation-id")
+	assert.NoError(t, err)
+
+	// Make sure it gets finalized properly
+	invocation, err = build_event_handler.LookupInvocation(te, auth.AuthContextFromAPIKey(ctx, "USER1"), "test-invocation-id")
+	assert.NoError(t, err)
+	assert.Equal(t, "abc123", invocation.CommitSha)
+	assert.Equal(t, inpb.Invocation_COMPLETE_INVOCATION_STATUS, invocation.InvocationStatus)
+}
+
+func TestFinishedFinalize(t *testing.T) {
+	te := testenv.GetTestEnv(t)
+	auth := testauth.NewTestAuthenticator(testauth.TestUsers("USER1", "GROUP1"))
+	te.SetAuthenticator(auth)
+	ctx, cancel := context.WithCancel(context.Background())
+
+	handler := build_event_handler.NewBuildEventHandler(te)
+	channel := handler.OpenChannel(ctx, "test-invocation-id")
+
+	// Send started event with api key
+	request := streamRequest(startedEvent("--remote_header='"+testauth.APIKeyHeader+"=USER1'"), "test-invocation-id", 1)
+	err := channel.HandleEvent(request)
+	assert.NoError(t, err)
+
+	// Send workspace status event with commit sha (which causes a flush)
+	request = streamRequest(workspaceStatusEvent("COMMIT_SHA", "abc123"), "test-invocation-id", 2)
+	err = channel.HandleEvent(request)
+	assert.NoError(t, err)
+
+	// Send finished event
+	request = streamRequest(finishedEvent(), "test-invocation-id", 3)
+	err = channel.HandleEvent(request)
+	assert.NoError(t, err)
+
+	// Make sure invocation is only readable by group and has commit sha
+	invocation, err := build_event_handler.LookupInvocation(te, auth.AuthContextFromAPIKey(ctx, "USER1"), "test-invocation-id")
+	assert.NoError(t, err)
+	assert.Equal(t, inpb.InvocationPermission_GROUP, invocation.ReadPermission)
+	assert.Equal(t, "abc123", invocation.CommitSha)
+	assert.Equal(t, inpb.Invocation_PARTIAL_INVOCATION_STATUS, invocation.InvocationStatus)
+
+	// Finalize the invocation
+	err = channel.FinalizeInvocation("test-invocation-id")
+	assert.NoError(t, err)
+	cancel()
+
+	// Make sure it gets finalized properly
+	invocation, err = build_event_handler.LookupInvocation(te, auth.AuthContextFromAPIKey(ctx, "USER1"), "test-invocation-id")
+	assert.NoError(t, err)
+	assert.Equal(t, "abc123", invocation.CommitSha)
+	assert.Equal(t, inpb.Invocation_COMPLETE_INVOCATION_STATUS, invocation.InvocationStatus)
+}
+
+func TestUnfinishedFinalizeWithCanceledContext(t *testing.T) {
+	te := testenv.GetTestEnv(t)
+	auth := testauth.NewTestAuthenticator(testauth.TestUsers("USER1", "GROUP1"))
+	te.SetAuthenticator(auth)
+	ctx, cancel := context.WithCancel(context.Background())
+
+	handler := build_event_handler.NewBuildEventHandler(te)
+	channel := handler.OpenChannel(ctx, "test-invocation-id")
+
+	// Send started event with api key
+	request := streamRequest(startedEvent("--remote_header='"+testauth.APIKeyHeader+"=USER1'"), "test-invocation-id", 1)
+	err := channel.HandleEvent(request)
+	assert.NoError(t, err)
+
+	// Send workspace status event with commit sha (which causes a flush)
+	request = streamRequest(workspaceStatusEvent("COMMIT_SHA", "abc123"), "test-invocation-id", 2)
+	err = channel.HandleEvent(request)
+	assert.NoError(t, err)
+
+	// Make sure invocation is only readable by group and has commit sha
+	invocation, err := build_event_handler.LookupInvocation(te, auth.AuthContextFromAPIKey(ctx, "USER1"), "test-invocation-id")
+	assert.NoError(t, err)
+	assert.Equal(t, inpb.InvocationPermission_GROUP, invocation.ReadPermission)
+	assert.Equal(t, "abc123", invocation.CommitSha)
+	assert.Equal(t, inpb.Invocation_PARTIAL_INVOCATION_STATUS, invocation.InvocationStatus)
+
+	// Cancel the context
+	cancel()
+
+	// Finalize the invocation
+	err = channel.FinalizeInvocation("test-invocation-id")
+	assert.NoError(t, err)
+
+	// Make sure it gets finalized properly
+	invocation, err = build_event_handler.LookupInvocation(te, auth.AuthContextFromAPIKey(ctx, "USER1"), "test-invocation-id")
+	assert.NoError(t, err)
+	assert.Equal(t, "abc123", invocation.CommitSha)
+	assert.Equal(t, inpb.Invocation_DISCONNECTED_INVOCATION_STATUS, invocation.InvocationStatus)
+}
+
+func TestUnfinishedFinalize(t *testing.T) {
+	te := testenv.GetTestEnv(t)
+	auth := testauth.NewTestAuthenticator(testauth.TestUsers("USER1", "GROUP1"))
+	te.SetAuthenticator(auth)
+	ctx, cancel := context.WithCancel(context.Background())
+
+	handler := build_event_handler.NewBuildEventHandler(te)
+	channel := handler.OpenChannel(ctx, "test-invocation-id")
+
+	// Send started event with api key
+	request := streamRequest(startedEvent("--remote_header='"+testauth.APIKeyHeader+"=USER1'"), "test-invocation-id", 1)
+	err := channel.HandleEvent(request)
+	assert.NoError(t, err)
+
+	// Send workspace status event with commit sha (which causes a flush)
+	request = streamRequest(workspaceStatusEvent("COMMIT_SHA", "abc123"), "test-invocation-id", 2)
+	err = channel.HandleEvent(request)
+	assert.NoError(t, err)
+
+	// Make sure invocation is only readable by group and has commit sha
+	invocation, err := build_event_handler.LookupInvocation(te, auth.AuthContextFromAPIKey(ctx, "USER1"), "test-invocation-id")
+	assert.NoError(t, err)
+	assert.Equal(t, inpb.InvocationPermission_GROUP, invocation.ReadPermission)
+	assert.Equal(t, "abc123", invocation.CommitSha)
+	assert.Equal(t, inpb.Invocation_PARTIAL_INVOCATION_STATUS, invocation.InvocationStatus)
+
+	// Finalize the invocation
+	err = channel.FinalizeInvocation("test-invocation-id")
+	assert.NoError(t, err)
+	cancel()
+
+	// Make sure it gets finalized properly
+	invocation, err = build_event_handler.LookupInvocation(te, auth.AuthContextFromAPIKey(ctx, "USER1"), "test-invocation-id")
+	assert.NoError(t, err)
+	assert.Equal(t, "abc123", invocation.CommitSha)
+	assert.Equal(t, inpb.Invocation_DISCONNECTED_INVOCATION_STATUS, invocation.InvocationStatus)
+}
+
+func TestRetryOnComplete(t *testing.T) {
+	te := testenv.GetTestEnv(t)
+	auth := testauth.NewTestAuthenticator(testauth.TestUsers("USER1", "GROUP1"))
+	te.SetAuthenticator(auth)
+	ctx := context.Background()
+
+	handler := build_event_handler.NewBuildEventHandler(te)
+	channel := handler.OpenChannel(ctx, "test-invocation-id")
+
+	// Send started event with api key
+	request := streamRequest(startedEvent("--remote_header='"+testauth.APIKeyHeader+"=USER1'"), "test-invocation-id", 1)
+	err := channel.HandleEvent(request)
+	assert.NoError(t, err)
+
+	// Write some stuff to disk so we can verify it gets removed on retry
+	request = streamRequest(progressEventWithOutput(strings.Repeat("a", te.GetConfigurator().GetStorageChunkFileSizeBytes()/2+1), ""), "test-invocation-id", 2)
+	err = channel.HandleEvent(request)
+	assert.NoError(t, err)
+
+	// Send workspace status event with commit sha (which causes a flush)
+	request = streamRequest(workspaceStatusEvent("COMMIT_SHA", "abc123"), "test-invocation-id", 2)
+	err = channel.HandleEvent(request)
+	assert.NoError(t, err)
+
+	// Send finished event
+	request = streamRequest(finishedEvent(), "test-invocation-id", 3)
+	err = channel.HandleEvent(request)
+	assert.NoError(t, err)
+
+	// Make sure invocation is only readable by group and has commit sha
+	invocation, err := build_event_handler.LookupInvocation(te, auth.AuthContextFromAPIKey(ctx, "USER1"), "test-invocation-id")
+	assert.NoError(t, err)
+	assert.Equal(t, inpb.InvocationPermission_GROUP, invocation.ReadPermission)
+	assert.Equal(t, "abc123", invocation.CommitSha)
+	assert.Equal(t, inpb.Invocation_PARTIAL_INVOCATION_STATUS, invocation.InvocationStatus)
+
+	// Finalize the invocation
+	err = channel.FinalizeInvocation("test-invocation-id")
+	assert.NoError(t, err)
+
+	// Make sure it gets finalized properly
+	invocation, err = build_event_handler.LookupInvocation(te, auth.AuthContextFromAPIKey(ctx, "USER1"), "test-invocation-id")
+	assert.NoError(t, err)
+	assert.Equal(t, "abc123", invocation.CommitSha)
+	assert.Equal(t, inpb.Invocation_COMPLETE_INVOCATION_STATUS, invocation.InvocationStatus)
+
+	exists, err := te.GetBlobstore().BlobExists(ctx, protofile.ChunkName("test-invocation-id", 0))
+	assert.NoError(t, err)
+	assert.True(t, exists)
+	exists, err = chunkstore.New(te.GetBlobstore(), &chunkstore.ChunkstoreOptions{}).BlobExists(ctx, eventlog.GetEventLogPathFromInvocationId("test-invocation-id"))
+	assert.NoError(t, err)
+	assert.True(t, exists)
+
+	// Attempt to start a new invocation with the same id
+	channel = handler.OpenChannel(ctx, "test-invocation-id")
+	request = streamRequest(startedEvent("--remote_header='"+testauth.APIKeyHeader+"=USER1'"), "test-invocation-id", 1)
+	err = channel.HandleEvent(request)
+	assert.NoError(t, err)
+
+	// Make sure old files were not deleted
+	exists, err = te.GetBlobstore().BlobExists(ctx, protofile.ChunkName("test-invocation-id", 0))
+	assert.NoError(t, err)
+	assert.True(t, exists)
+	exists, err = chunkstore.New(te.GetBlobstore(), &chunkstore.ChunkstoreOptions{}).BlobExists(ctx, eventlog.GetEventLogPathFromInvocationId("test-invocation-id"))
+	assert.NoError(t, err)
+	assert.True(t, exists)
+
+}
+
+func TestRetryOnDisconnect(t *testing.T) {
+	te := testenv.GetTestEnv(t)
+	auth := testauth.NewTestAuthenticator(testauth.TestUsers("USER1", "GROUP1"))
+	te.SetAuthenticator(auth)
+	ctx := context.Background()
+
+	handler := build_event_handler.NewBuildEventHandler(te)
+	channel := handler.OpenChannel(ctx, "test-invocation-id")
+
+	// Send started event with api key
+	request := streamRequest(startedEvent("--remote_header='"+testauth.APIKeyHeader+"=USER1'"), "test-invocation-id", 1)
+	err := channel.HandleEvent(request)
+	assert.NoError(t, err)
+
+	// Write some stuff to disk so we can verify it gets removed on retry
+	request = streamRequest(progressEventWithOutput(strings.Repeat("a", te.GetConfigurator().GetStorageChunkFileSizeBytes()/2+1), ""), "test-invocation-id", 2)
+	err = channel.HandleEvent(request)
+	assert.NoError(t, err)
+
+	// Send workspace status event with commit sha (which causes a flush)
+	request = streamRequest(workspaceStatusEvent("COMMIT_SHA", "abc123"), "test-invocation-id", 3)
+	err = channel.HandleEvent(request)
+	assert.NoError(t, err)
+
+	// Make sure invocation is only readable by group and has commit sha
+	invocation, err := build_event_handler.LookupInvocation(te, auth.AuthContextFromAPIKey(ctx, "USER1"), "test-invocation-id")
+	assert.NoError(t, err)
+	assert.Equal(t, inpb.InvocationPermission_GROUP, invocation.ReadPermission)
+	assert.Equal(t, "abc123", invocation.CommitSha)
+	assert.Equal(t, inpb.Invocation_PARTIAL_INVOCATION_STATUS, invocation.InvocationStatus)
+
+	// Finalize the invocation
+	err = channel.FinalizeInvocation("test-invocation-id")
+	assert.NoError(t, err)
+
+	// Make sure it gets finalized properly
+	invocation, err = build_event_handler.LookupInvocation(te, auth.AuthContextFromAPIKey(ctx, "USER1"), "test-invocation-id")
+	assert.NoError(t, err)
+	assert.Equal(t, "abc123", invocation.CommitSha)
+	assert.Equal(t, inpb.Invocation_DISCONNECTED_INVOCATION_STATUS, invocation.InvocationStatus)
+
+	exists, err := te.GetBlobstore().BlobExists(ctx, protofile.ChunkName("test-invocation-id", 0))
+	assert.NoError(t, err)
+	assert.True(t, exists)
+	exists, err = chunkstore.New(te.GetBlobstore(), &chunkstore.ChunkstoreOptions{}).BlobExists(ctx, eventlog.GetEventLogPathFromInvocationId("test-invocation-id"))
+	assert.NoError(t, err)
+	assert.True(t, exists)
+
+	// Attempt to start a new invocation with the same id
+	channel = handler.OpenChannel(ctx, "test-invocation-id")
+	request = streamRequest(startedEvent("--remote_header='"+testauth.APIKeyHeader+"=USER1'"), "test-invocation-id", 1)
+	err = channel.HandleEvent(request)
+	assert.NoError(t, err)
+
+	// Make sure the old protofile was removed
+	exists, err = te.GetBlobstore().BlobExists(ctx, protofile.ChunkName("test-invocation-id", 0))
+	assert.NoError(t, err)
+	assert.False(t, exists)
+
+	// Make sure old event log was deleted
+	exists, err = chunkstore.New(te.GetBlobstore(), &chunkstore.ChunkstoreOptions{}).BlobExists(ctx, eventlog.GetEventLogPathFromInvocationId("test-invocation-id"))
+	assert.NoError(t, err)
+	assert.False(t, exists)
+
+	// Send workspace status event with commit sha (which causes a flush)
+	request = streamRequest(workspaceStatusEvent("COMMIT_SHA", "def456"), "test-invocation-id", 2)
+	err = channel.HandleEvent(request)
+	assert.NoError(t, err)
+
+	// Send finished event
+	request = streamRequest(finishedEvent(), "test-invocation-id", 3)
+	err = channel.HandleEvent(request)
+	assert.NoError(t, err)
+
+	// Make sure invocation is only readable by group and has commit sha
+	invocation, err = build_event_handler.LookupInvocation(te, auth.AuthContextFromAPIKey(ctx, "USER1"), "test-invocation-id")
+	assert.NoError(t, err)
+	assert.Equal(t, inpb.InvocationPermission_GROUP, invocation.ReadPermission)
+	assert.Equal(t, "def456", invocation.CommitSha)
+	assert.Equal(t, inpb.Invocation_PARTIAL_INVOCATION_STATUS, invocation.InvocationStatus)
+
+	// Finalize the invocation
+	err = channel.FinalizeInvocation("test-invocation-id")
+	assert.NoError(t, err)
+
+	// Make sure it gets finalized properly
+	invocation, err = build_event_handler.LookupInvocation(te, auth.AuthContextFromAPIKey(ctx, "USER1"), "test-invocation-id")
+	assert.NoError(t, err)
+	assert.Equal(t, "def456", invocation.CommitSha)
+	assert.Equal(t, inpb.Invocation_COMPLETE_INVOCATION_STATUS, invocation.InvocationStatus)
+}
+
+func TestRetryOnOldDisconnect(t *testing.T) {
+	te := testenv.GetTestEnv(t)
+	auth := testauth.NewTestAuthenticator(testauth.TestUsers("USER1", "GROUP1"))
+	te.SetAuthenticator(auth)
+	ctx := context.Background()
+
+	handler := build_event_handler.NewBuildEventHandler(te)
+	channel := handler.OpenChannel(ctx, "test-invocation-id")
+
+	// Say that it occurred 5 hours ago
+	te.GetInvocationDB().SetNowFunc(testclock.StartingAt(time.Now().Add(-5 * time.Hour)).Now)
+
+	// Send started event with api key
+	request := streamRequest(startedEvent("--remote_header='"+testauth.APIKeyHeader+"=USER1'"), "test-invocation-id", 1)
+	err := channel.HandleEvent(request)
+	assert.NoError(t, err)
+
+	// Write some stuff to disk so we can verify it gets removed on retry
+	request = streamRequest(progressEventWithOutput(strings.Repeat("a", te.GetConfigurator().GetStorageChunkFileSizeBytes()/2+1), ""), "test-invocation-id", 2)
+	err = channel.HandleEvent(request)
+	assert.NoError(t, err)
+
+	// Send workspace status event with commit sha (which causes a flush)
+	request = streamRequest(workspaceStatusEvent("COMMIT_SHA", "abc123"), "test-invocation-id", 2)
+	err = channel.HandleEvent(request)
+	assert.NoError(t, err)
+
+	// Make sure invocation is only readable by group and has commit sha
+	invocation, err := build_event_handler.LookupInvocation(te, auth.AuthContextFromAPIKey(ctx, "USER1"), "test-invocation-id")
+	assert.NoError(t, err)
+	assert.Equal(t, inpb.InvocationPermission_GROUP, invocation.ReadPermission)
+	assert.Equal(t, "abc123", invocation.CommitSha)
+	assert.Equal(t, inpb.Invocation_PARTIAL_INVOCATION_STATUS, invocation.InvocationStatus)
+
+	// Finalize the invocation
+	err = channel.FinalizeInvocation("test-invocation-id")
+	assert.NoError(t, err)
+
+	// Make sure it gets finalized properly
+	invocation, err = build_event_handler.LookupInvocation(te, auth.AuthContextFromAPIKey(ctx, "USER1"), "test-invocation-id")
+	assert.NoError(t, err)
+	assert.Equal(t, "abc123", invocation.CommitSha)
+	assert.Equal(t, inpb.Invocation_DISCONNECTED_INVOCATION_STATUS, invocation.InvocationStatus)
+
+	exists, err := te.GetBlobstore().BlobExists(ctx, protofile.ChunkName("test-invocation-id", 0))
+	assert.NoError(t, err)
+	assert.True(t, exists)
+	exists, err = chunkstore.New(te.GetBlobstore(), &chunkstore.ChunkstoreOptions{}).BlobExists(ctx, eventlog.GetEventLogPathFromInvocationId("test-invocation-id"))
+	assert.NoError(t, err)
+	assert.True(t, exists)
+
+	// Reset the time for the database
+	te.GetInvocationDB().SetNowFunc(time.Now)
+
+	// Attempt to start a new invocation with the same id
+	channel = handler.OpenChannel(ctx, "test-invocation-id")
+	request = streamRequest(startedEvent("--remote_header='"+testauth.APIKeyHeader+"=USER1'"), "test-invocation-id", 1)
+	err = channel.HandleEvent(request)
+	assert.NoError(t, err)
+
+	// Make sure old files were not deleted
+	exists, err = te.GetBlobstore().BlobExists(ctx, protofile.ChunkName("test-invocation-id", 0))
+	assert.NoError(t, err)
+	assert.True(t, exists)
+	exists, err = chunkstore.New(te.GetBlobstore(), &chunkstore.ChunkstoreOptions{}).BlobExists(ctx, eventlog.GetEventLogPathFromInvocationId("test-invocation-id"))
+	assert.NoError(t, err)
+	assert.True(t, exists)
 }

@@ -92,8 +92,17 @@ const (
 	/// GroupID associated with the request.
 	GroupID = "group_id"
 
+	/// OS associated with the request.
+	OS = "os"
+
+	/// Arch associated with the request.
+	Arch = "arch"
+
 	/// EventName is the name used to identify the type of an unexpected event.
 	EventName = "name"
+
+	/// PartitionID is the ID of the disk cache partition this event applied to.
+	PartitionID = "partition_id"
 )
 
 const (
@@ -258,6 +267,15 @@ var (
 	/// )
 	/// ```
 
+	DiskCacheLastEvictionAgeUsec = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Namespace: bbNamespace,
+		Subsystem: "remote_cache",
+		Name:      "disk_cache_last_eviction_age_usec",
+		Help:      "The age (in usec) of the item most recently evicted from the cache",
+	}, []string{
+		PartitionID,
+	})
+
 	/// ## Remote execution metrics
 
 	RemoteExecutionCount = promauto.NewCounterVec(prometheus.CounterOpts{
@@ -284,14 +302,6 @@ var (
 		Help:      "Time spent in each stage of action execution, in **microseconds**. Queries should filter or group by the `stage` label, taking care not to aggregate different stages.",
 	}, []string{
 		ExecutedActionStageLabel,
-	})
-
-	RemoteExecutionWaitingExecutionResult = promauto.NewGaugeVec(prometheus.GaugeOpts{
-		Namespace: bbNamespace,
-		Subsystem: "remote_execution",
-		Name:      "waiting_execution_result",
-		Help:      "Number of execution requests for which the client is actively waiting for results.",
-	}, []string{
 		GroupID,
 	})
 
@@ -309,6 +319,40 @@ var (
 	///	  0.9,
 	///   sum(rate(buildbuddy_remote_execution_executed_action_metadata_durations_usec_bucket{stage="execution"}[5m])) by (le)
 	/// )
+	/// ```
+
+	RemoteExecutionWaitingExecutionResult = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Namespace: bbNamespace,
+		Subsystem: "remote_execution",
+		Name:      "waiting_execution_result",
+		Help:      "Number of execution requests for which the client is actively waiting for results.",
+	}, []string{
+		GroupID,
+	})
+
+	/// #### Examples
+	///
+	/// ```promql
+	/// # Total number of execution requests with client waiting for result.
+	/// sum(buildbuddy_remote_execution_waiting_execution_result)
+	/// ```
+
+	RemoteExecutionRequests = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: bbNamespace,
+		Subsystem: "remote_execution",
+		Name:      "requests",
+		Help:      "Number of execution requests received.",
+	}, []string{
+		GroupID,
+		OS,
+		Arch,
+	})
+
+	/// #### Examples
+	///
+	/// ```promql
+	/// # Rate of new execution requests by OS/Arch.
+	/// sum(rate(buildbuddy_remote_execution_requests[1m])) by (os, arch)
 	/// ```
 
 	RemoteExecutionQueueLength = promauto.NewGaugeVec(prometheus.GaugeOpts{

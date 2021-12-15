@@ -11,6 +11,7 @@ storage:
   ttl_seconds: 86400 # One day in seconds.
   disk:
     root_directory: /tmp/buildbuddy_enterprise
+  enable_chunked_event_logs: true
 cache:
   max_size_bytes: 10000000000 # 10 GB
   #in_memory: true
@@ -18,10 +19,11 @@ cache:
     root_directory: /tmp/buildbuddy-enterprise-cache
 auth:
   enable_anonymous_usage: true
-  oauth_providers:
-    - issuer_url: "https://accounts.google.com"
-      client_id: "${BB_DEV_OAUTH_CLIENT_ID}"
-      client_secret: "${BB_DEV_OAUTH_CLIENT_SECRET}"
+  enable_self_auth: true
+  # oauth_providers:
+  #   - issuer_url: "https://accounts.google.com"
+  #     client_id: "${BB_DEV_OAUTH_CLIENT_ID}"
+  #     client_secret: "${BB_DEV_OAUTH_CLIENT_SECRET}"
 api:
   enable_api: true
 github:

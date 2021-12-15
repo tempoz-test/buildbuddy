@@ -1,5 +1,7 @@
 import React from "react";
 import { build } from "../../proto/remote_execution_ts_proto";
+import { Download, FolderMinus, FolderPlus } from "lucide-react";
+import DigestComponent from "../components/digest/digest";
 
 interface Props {
   node: InputNode;
@@ -27,18 +29,15 @@ export default class InputNodeComponent extends React.Component<Props, State> {
           onClick={() => this.props.handleFileClicked(this.props.node)}>
           <span>
             {this.props.node.type == "file" ? (
-              <img className="file-icon" src="/image/download.svg" />
+              <Download className="icon file-icon" />
             ) : (
               <span>
-                {expanded ? (
-                  <img className="file-icon" src="/image/folder-minus.svg" />
-                ) : (
-                  <img className="file-icon" src="/image/folder-plus.svg" />
-                )}
+                {expanded ? <FolderMinus className="icon file-icon" /> : <FolderPlus className="icon file-icon" />}
               </span>
             )}
           </span>{" "}
           <span className="input-tree-node-label">{this.props.node.obj.name}</span>
+          <DigestComponent digest={this.props.node.obj.digest} />
         </div>
         {expanded && (
           <div className="input-tree-node-children">

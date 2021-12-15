@@ -10,13 +10,20 @@
 }
 
 .input-tree-node {
-  margin-bottom: 2px;
   cursor: pointer;
   user-select: none;
 }
 
-.input-tree-node-name:hover {
-  opacity: 0.5;
+.input-tree-node-name .digest-component {
+  margin-left: 8px;
+}
+
+.input-tree-node-name .icon {
+  opacity: 0.7;
+}
+
+.input-tree-node-name:hover .icon {
+  opacity: 1;
 }
 
 .input-tree-node-children {
@@ -28,24 +35,32 @@
 .input-tree-node-name {
   display: flex;
   font-size: 12px;
+  margin-bottom: 2px;
+  align-items: flex-start;
 }
 
 .input-tree-node-label {
   padding-top: 1px;
+  flex-shrink: 0;
 }
 
-.file-icon {
-  margin-right: 8px;
-  margin-left: 0px;
-  padding-top: 1.5px;
+.invocation-action-card .icon.file-icon {
+  margin-right: 4px;
+  width: 18px;
+  height: 18px;
 }
 
 .file-name {
   display: flex;
+  align-items: flex-start;
 }
 
 .file-name:hover {
-  opacity: 0.5;
+  color: #888;
+}
+
+.file-name .digest-component {
+  margin-left: 8px;
 }
 
 .action-timeline {
@@ -232,7 +247,7 @@
   flex-grow: 10;
 }
 
-.invocation-share-button img {
+.invocation-share-button svg {
   margin-right: 12px;
   margin-left: -4px;
   width: 16px;
@@ -317,10 +332,12 @@
 }
 
 .invocation-execution-row-digest {
+  line-height: 1.2em;
   font-size: 0.8em;
   font-weight: 600;
   margin-bottom: 4px;
   cursor: pointer;
+  display: flex;
 }
 
 .invocation-execution-row-stats div {
@@ -455,10 +472,6 @@
   color: #444;
 }
 
-.prop-link:hover {
-  opacity: 0.7;
-}
-
 .prop-value .detail {
   color: #aaa;
 }
@@ -467,9 +480,14 @@
   margin-right: 8px;
 }
 
-.workflow-rerun-button img {
+.workflow-rerun-button svg {
   width: 16px;
   height: 16px;
+  flex-shrink: 0;
+}
+
+.workflow-rerun-button .spinner {
+  --size: 16px;
 }
 
 .workflow-rerun-button .loading {

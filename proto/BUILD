@@ -147,8 +147,8 @@ proto_library(
 )
 
 proto_library(
-    name = "vmcasfs_proto",
-    srcs = ["vmcasfs.proto"],
+    name = "vmvfs_proto",
+    srcs = ["vmvfs.proto"],
     deps = [":remote_execution_proto"],
 )
 
@@ -202,6 +202,7 @@ proto_library(
     srcs = ["user.proto"],
     exports = [":user_id_proto"],
     deps = [
+        ":context_proto",
         ":group_proto",
         ":user_id_proto",
     ],
@@ -241,6 +242,7 @@ proto_library(
         ":execution_stats_proto",
         ":group_proto",
         ":invocation_proto",
+        ":runner_proto",
         ":scheduler_proto",
         ":target_proto",
         ":usage_proto",
@@ -430,10 +432,10 @@ go_proto_library(
 )
 
 go_proto_library(
-    name = "vmcasfs_go_proto",
+    name = "vmvfs_go_proto",
     compilers = ["@io_bazel_rules_go//proto:go_grpc"],
-    importpath = "github.com/buildbuddy-io/buildbuddy/proto/vmcasfs",
-    proto = ":vmcasfs_proto",
+    importpath = "github.com/buildbuddy-io/buildbuddy/proto/vmvfs",
+    proto = ":vmvfs_proto",
     deps = [
         ":remote_execution_go_proto",
     ],
@@ -450,6 +452,15 @@ go_proto_library(
     name = "workflow_go_proto",
     importpath = "github.com/buildbuddy-io/buildbuddy/proto/workflow",
     proto = ":workflow_proto",
+    deps = [
+        ":context_go_proto",
+    ],
+)
+
+go_proto_library(
+    name = "runner_go_proto",
+    importpath = "github.com/buildbuddy-io/buildbuddy/proto/runner",
+    proto = ":runner_proto",
     deps = [
         ":context_go_proto",
     ],
@@ -501,6 +512,7 @@ go_proto_library(
         ":execution_stats_go_proto",
         ":group_go_proto",
         ":invocation_go_proto",
+        ":runner_go_proto",
         ":scheduler_go_proto",
         ":target_go_proto",
         ":usage_go_proto",
@@ -526,6 +538,7 @@ go_proto_library(
     importpath = "github.com/buildbuddy-io/buildbuddy/proto/user",
     proto = ":user_proto",
     deps = [
+        ":context_go_proto",
         ":group_go_proto",
         ":user_id_go_proto",
     ],
@@ -747,4 +760,9 @@ ts_proto_library(
 ts_proto_library(
     name = "remote_execution_ts_proto",
     proto = ":remote_execution_proto",
+)
+
+ts_proto_library(
+    name = "runner_ts_proto",
+    proto = ":runner_proto",
 )

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"runtime"
+	"strconv"
 	"strings"
 
 	"github.com/buildbuddy-io/buildbuddy/server/config"
@@ -24,13 +25,14 @@ const (
 	//     x-buildbuddy-platform.container-registry-username: _json_key
 	overrideHeaderPrefix = "x-buildbuddy-platform."
 
+	poolPropertyName = "Pool"
 	// DefaultPoolValue is the value for the "Pool" platform property that selects
 	// the default executor pool for remote execution.
 	DefaultPoolValue = "default"
 
 	containerImagePropertyName = "container-image"
 	DefaultContainerImage      = "gcr.io/flame-public/executor-docker-default:enterprise-v1.5.4"
-	dockerPrefix               = "docker://"
+	DockerPrefix               = "docker://"
 
 	containerRegistryUsernamePropertyName = "container-registry-username"
 	containerRegistryPasswordPropertyName = "container-registry-password"
@@ -39,20 +41,37 @@ const (
 	// empty or unset.
 	unsetContainerImageVal = "none"
 
-	RecycleRunnerPropertyName        = "recycle-runner"
-	preserveWorkspacePropertyName    = "preserve-workspace"
-	cleanWorkspaceInputsPropertyName = "clean-workspace-inputs"
-	persistentWorkerPropertyName     = "persistent-workers"
-	persistentWorkerKeyPropertyName  = "persistentWorkerKey"
-	WorkflowIDPropertyName           = "workflow-id"
-	workloadIsolationPropertyName    = "workload-isolation-type"
-	enableCASFSPropertyName          = "enable-casfs"
+	RecycleRunnerPropertyName            = "recycle-runner"
+	preserveWorkspacePropertyName        = "preserve-workspace"
+	nonrootWorkspacePropertyName         = "nonroot-workspace"
+	cleanWorkspaceInputsPropertyName     = "clean-workspace-inputs"
+	persistentWorkerPropertyName         = "persistent-workers"
+	persistentWorkerKeyPropertyName      = "persistentWorkerKey"
+	persistentWorkerProtocolPropertyName = "persistentWorkerProtocol"
+	WorkflowIDPropertyName               = "workflow-id"
+	workloadIsolationPropertyName        = "workload-isolation-type"
+	enableVFSPropertyName                = "enable-vfs"
 
 	operatingSystemPropertyName = "OSFamily"
-	defaultOperatingSystemName  = "linux"
-	darwinOperatingSystemName   = "darwin"
+	LinuxOperatingSystemName    = "linux"
+	defaultOperatingSystemName  = LinuxOperatingSystemName
+	DarwinOperatingSystemName   = "darwin"
+
+	cpuArchitecturePropertyName = "Arch"
+	defaultCPUArchitecture      = "amd64"
+
 	// Using the property defined here: https://github.com/bazelbuild/bazel-toolchains/blob/v5.1.0/rules/exec_properties/exec_properties.bzl#L164
 	dockerRunAsRootPropertyName = "dockerRunAsRoot"
+
+	// A BuildBuddy Compute Unit is defined as 1 cpu and 2.5GB of memory.
+	EstimatedComputeUnitsPropertyName = "EstimatedComputeUnits"
+
+	// EstimatedFreeDiskPropertyName specifies how much "scratch space" beyond the
+	// input files a task requires to be able to function. This is useful for
+	// managed Bazel + Firecracker because for Firecracker we need to decide ahead
+	// of time how big the workspace filesystem is going to be, and managed Bazel
+	// requires a relatively large amount of free space compared to typical actions.
+	EstimatedFreeDiskPropertyName = "EstimatedFreeDiskBytes"
 
 	BareContainerType        ContainerType = "none"
 	DockerContainerType      ContainerType = "docker"
@@ -63,21 +82,35 @@ const (
 // Properties represents the platform properties parsed from a command.
 type Properties struct {
 	OS                        string
+	Arch                      string
+	Pool                      string
+	EstimatedComputeUnits     int64
+	EstimatedFreeDiskBytes    int64
 	ContainerImage            string
 	ContainerRegistryUsername string
 	ContainerRegistryPassword string
 	WorkloadIsolationType     string
 	DockerForceRoot           bool
 	RecycleRunner             bool
-	EnableCASFS               bool
+	EnableVFS                 bool
 	// PreserveWorkspace specifies whether to delete all files in the workspace
 	// before running each action. If true, all files are kept except for output
 	// files and directories.
-	PreserveWorkspace    bool
-	CleanWorkspaceInputs string
-	PersistentWorker     bool
-	PersistentWorkerKey  string
-	WorkflowID           string
+	PreserveWorkspace bool
+	// NonrootWorkspace specifies whether workspace directories should be made
+	// writable by users other than the executor user (which is the root user for
+	// production workloads). This is required to be set when running actions
+	// within a container image that has a USER other than root.
+	//
+	// TODO(bduffany): Consider making this the default behavior, or inferring it
+	// by inspecting the image and checking that the USER spec is anything other
+	// than "root" or "0".
+	NonrootWorkspace         bool
+	CleanWorkspaceInputs     string
+	PersistentWorker         bool
+	PersistentWorkerKey      string
+	PersistentWorkerProtocol string
+	WorkflowID               string
 }
 
 // ContainerType indicates the type of containerization required by an executor.
@@ -101,19 +134,32 @@ func ParseProperties(task *repb.ExecutionTask) *Properties {
 	for _, prop := range task.GetPlatformOverrides().GetProperties() {
 		m[strings.ToLower(prop.GetName())] = strings.TrimSpace(prop.GetValue())
 	}
+
+	pool := stringProp(m, poolPropertyName, "")
+	// Treat the explicit default pool value as empty string
+	if pool == DefaultPoolValue {
+		pool = ""
+	}
+
 	return &Properties{
-		OS:                        stringProp(m, operatingSystemPropertyName, defaultOperatingSystemName),
+		OS:                        strings.ToLower(stringProp(m, operatingSystemPropertyName, defaultOperatingSystemName)),
+		Arch:                      strings.ToLower(stringProp(m, cpuArchitecturePropertyName, defaultCPUArchitecture)),
+		Pool:                      strings.ToLower(pool),
+		EstimatedComputeUnits:     int64Prop(m, EstimatedComputeUnitsPropertyName, 0),
+		EstimatedFreeDiskBytes:    int64Prop(m, EstimatedFreeDiskPropertyName, 0),
 		ContainerImage:            stringProp(m, containerImagePropertyName, ""),
 		ContainerRegistryUsername: stringProp(m, containerRegistryUsernamePropertyName, ""),
 		ContainerRegistryPassword: stringProp(m, containerRegistryPasswordPropertyName, ""),
 		WorkloadIsolationType:     stringProp(m, workloadIsolationPropertyName, ""),
 		DockerForceRoot:           boolProp(m, dockerRunAsRootPropertyName, false),
 		RecycleRunner:             boolProp(m, RecycleRunnerPropertyName, false),
-		EnableCASFS:               boolProp(m, enableCASFSPropertyName, false),
+		EnableVFS:                 boolProp(m, enableVFSPropertyName, false),
 		PreserveWorkspace:         boolProp(m, preserveWorkspacePropertyName, false),
+		NonrootWorkspace:          boolProp(m, nonrootWorkspacePropertyName, false),
 		CleanWorkspaceInputs:      stringProp(m, cleanWorkspaceInputsPropertyName, ""),
 		PersistentWorker:          boolProp(m, persistentWorkerPropertyName, false),
 		PersistentWorkerKey:       stringProp(m, persistentWorkerKeyPropertyName, ""),
+		PersistentWorkerProtocol:  stringProp(m, persistentWorkerProtocolPropertyName, ""),
 		WorkflowID:                stringProp(m, WorkflowIDPropertyName, ""),
 	}
 }
@@ -231,16 +277,16 @@ func ApplyOverrides(env environment.Env, executorProps *ExecutorProperties, plat
 		// container was set then we set our default.
 		if strings.EqualFold(platformProps.ContainerImage, "none") || platformProps.ContainerImage == "" {
 			platformProps.ContainerImage = defaultContainerImage
-		} else if !strings.HasPrefix(platformProps.ContainerImage, dockerPrefix) {
+		} else if !strings.HasPrefix(platformProps.ContainerImage, DockerPrefix) {
 			// Return an error if a client specified an unparseable
 			// container reference.
 			return status.InvalidArgumentError("Malformed container image string.")
 		}
 		// Trim the docker prefix from ContainerImage -- we no longer need it.
-		platformProps.ContainerImage = strings.TrimPrefix(platformProps.ContainerImage, dockerPrefix)
+		platformProps.ContainerImage = strings.TrimPrefix(platformProps.ContainerImage, DockerPrefix)
 	}
 
-	if strings.EqualFold(platformProps.OS, darwinOperatingSystemName) {
+	if strings.EqualFold(platformProps.OS, DarwinOperatingSystemName) {
 		appleSDKVersion := ""
 		appleSDKPlatform := "MacOSX"
 		xcodeVersion := executorProps.DefaultXCodeVersion
@@ -290,6 +336,19 @@ func boolProp(props map[string]string, name string, defaultValue bool) bool {
 		return defaultValue
 	}
 	return strings.EqualFold(val, "true")
+}
+
+func int64Prop(props map[string]string, name string, defaultValue int64) int64 {
+	val := props[strings.ToLower(name)]
+	if val == "" {
+		return defaultValue
+	}
+	i, err := strconv.ParseInt(val, 10, 64)
+	if err != nil {
+		log.Warningf("Could not parse platform property %q as int64: %s", name, err)
+		return defaultValue
+	}
+	return i
 }
 
 func stringListProp(props map[string]string, name string) []string {

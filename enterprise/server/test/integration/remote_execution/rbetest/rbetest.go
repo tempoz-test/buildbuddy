@@ -7,10 +7,12 @@ import (
 	"fmt"
 	"math/rand"
 	"net"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -29,24 +31,31 @@ import (
 	"github.com/buildbuddy-io/buildbuddy/server/build_event_protocol/build_event_handler"
 	"github.com/buildbuddy-io/buildbuddy/server/build_event_protocol/build_event_server"
 	"github.com/buildbuddy-io/buildbuddy/server/buildbuddy_server"
+	"github.com/buildbuddy-io/buildbuddy/server/interfaces"
 	"github.com/buildbuddy-io/buildbuddy/server/remote_cache/action_cache_server"
 	"github.com/buildbuddy-io/buildbuddy/server/remote_cache/byte_stream_server"
 	"github.com/buildbuddy-io/buildbuddy/server/remote_cache/cachetools"
 	"github.com/buildbuddy-io/buildbuddy/server/remote_cache/content_addressable_storage_server"
+	"github.com/buildbuddy-io/buildbuddy/server/resources"
 	"github.com/buildbuddy-io/buildbuddy/server/tables"
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/app"
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testauth"
+	"github.com/buildbuddy-io/buildbuddy/server/testutil/testdigest"
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testenv"
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testfs"
+	"github.com/buildbuddy-io/buildbuddy/server/util/fileresolver"
 	"github.com/buildbuddy-io/buildbuddy/server/util/grpc_client"
+	"github.com/buildbuddy-io/buildbuddy/server/util/grpc_server"
 	"github.com/buildbuddy-io/buildbuddy/server/util/log"
 	"github.com/buildbuddy-io/buildbuddy/server/util/prefix"
+	"github.com/buildbuddy-io/buildbuddy/server/util/role"
 	"github.com/golang/protobuf/proto"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/metadata"
 
+	bundle "github.com/buildbuddy-io/buildbuddy/enterprise"
 	retpb "github.com/buildbuddy-io/buildbuddy/enterprise/server/test/integration/remote_execution/proto"
 	akpb "github.com/buildbuddy-io/buildbuddy/proto/api_key"
 	bbspb "github.com/buildbuddy-io/buildbuddy/proto/buildbuddy_service"
@@ -60,7 +69,6 @@ import (
 
 const (
 	ExecutorAPIKey = "EXECUTOR_API_KEY"
-	ExecutorGroup  = "GR123"
 
 	testCommandBinaryRunfilePath = "enterprise/server/test/integration/remote_execution/command/testcommand_/testcommand"
 	testCommandBinaryName        = "testcommand"
@@ -71,12 +79,18 @@ const (
 	defaultWaitTimeout = 20 * time.Second
 )
 
+func init() {
+	// Set umask to match the executor process.
+	syscall.Umask(0)
+}
+
 // Env is an integration test environment for Remote Build Execution.
 type Env struct {
 	t                     *testing.T
 	testEnv               *testenv.TestEnv
 	rbeClient             *rbeclient.Client
 	redisTarget           string
+	rootDataDir           string
 	buildBuddyServers     []*BuildBuddyServer
 	executors             map[string]*Executor
 	testCommandController *testCommandController
@@ -84,8 +98,9 @@ type Env struct {
 	executorNameCounter uint64
 	envOpts             *enterprise_testenv.Options
 
-	UserID1  string
-	GroupID1 string
+	UserID1         string
+	GroupID1        string
+	ExecutorGroupID string
 }
 
 func (r *Env) GetBuildBuddyServiceClient() bbspb.BuildBuddyServiceClient {
@@ -136,27 +151,74 @@ func NewRBETestEnv(t *testing.T) *Env {
 	redisTarget := testredis.Start(t)
 	envOpts := &enterprise_testenv.Options{RedisTarget: redisTarget}
 	testEnv := enterprise_testenv.GetCustomTestEnv(t, envOpts)
-	// Create a group for use in tests (this will also create an API key for the
-	// group).
+	// Create a user and group in the DB for use in tests (this will also create
+	// an API key for the group).
+	// TODO(http://go/b/949): Add a fake OIDC provider and then just have a real
+	// user log into the app to do all of this setup in a more sane way.
 	orgURLID := "test"
 	userID := "US1"
-	groupID, err := testEnv.GetUserDB().InsertOrUpdateGroup(context.Background(), &tables.Group{
-		URLIdentifier: &orgURLID,
-		UserID:        "US1",
+	ctx := context.Background()
+	err := testEnv.GetUserDB().InsertUser(ctx, &tables.User{
+		UserID: userID,
+		Email:  "user@example.com",
 	})
 	require.NoError(t, err)
+	groupID, err := testEnv.GetUserDB().InsertOrUpdateGroup(ctx, &tables.Group{
+		URLIdentifier: &orgURLID,
+		UserID:        userID,
+	})
+	require.NoError(t, err)
+	err = testEnv.GetUserDB().AddUserToGroup(ctx, userID, groupID)
+	require.NoError(t, err)
+	// Update the API key value to match the user ID, since the test authenticator
+	// treats user IDs and API keys the same.
+	err = testEnv.GetDBHandle().Exec(
+		`UPDATE APIKeys SET value = ? WHERE group_id = ?`, userID, groupID).Error
+	require.NoError(t, err)
+	// Create executor group
+	execGroupSlug := "executor-group"
+	executorGroupID, err := testEnv.GetUserDB().InsertOrUpdateGroup(ctx, &tables.Group{
+		URLIdentifier: &execGroupSlug,
+		UserID:        userID,
+	})
+	require.NoError(t, err)
+	// Note: This root data dir (under which all executors' data is placed) does
+	// not get cleaned up until after all executors are shutdown (in the cleanup
+	// func below), since test cleanup funcs are run in LIFO order.
+	rootDataDir := testfs.MakeTempDir(t)
 	rbe := &Env{
-		testEnv:     testEnv,
-		t:           t,
-		redisTarget: redisTarget,
-		executors:   make(map[string]*Executor),
-		envOpts:     envOpts,
-		GroupID1:    groupID,
-		UserID1:     userID,
+		testEnv:         testEnv,
+		t:               t,
+		redisTarget:     redisTarget,
+		executors:       make(map[string]*Executor),
+		envOpts:         envOpts,
+		GroupID1:        groupID,
+		UserID1:         userID,
+		ExecutorGroupID: executorGroupID,
+		rootDataDir:     rootDataDir,
 	}
 	testEnv.SetAuthenticator(rbe.newTestAuthenticator())
 	rbe.testCommandController = newTestCommandController(t)
 	rbe.rbeClient = rbeclient.New(rbe)
+
+	t.Cleanup(func() {
+		log.Warningf("Shutting down executors...")
+		var wg sync.WaitGroup
+		for id, e := range rbe.executors {
+			id, e := id, e
+			e.env.GetHealthChecker().Shutdown()
+			wg.Add(1)
+			go func() {
+				log.Infof("Waiting for executor %q to shut down.", id)
+				e.env.GetHealthChecker().WaitForGracefulShutdown()
+				wg.Done()
+			}()
+			log.Infof("Shut down for executor %q completed.", id)
+		}
+		log.Warningf("Waiting for executor shutdown to finish...")
+		wg.Wait()
+	})
+
 	return rbe
 }
 
@@ -204,20 +266,21 @@ func newBuildBuddyServer(t *testing.T, env *buildBuddyServerEnv, opts *BuildBudd
 	router, err := task_router.New(env)
 	require.NoError(t, err, "could not set up TaskRouter")
 	env.SetTaskRouter(router)
-	scheduler, err := scheduler_server.NewSchedulerServerWithOptions(env, &opts.SchedulerServerOptions)
-	require.NoError(t, err, "could not set up SchedulerServer")
 	executionServer, err := execution_server.NewExecutionServer(env)
 	require.NoError(t, err, "could not set up ExecutionServer")
 	env.SetRemoteExecutionService(executionServer)
-	buildBuddyServiceServer, err := buildbuddy_server.NewBuildBuddyServer(env, nil /*=sslService*/)
-	require.NoError(t, err, "could not set up BuildBuddyServiceServer")
-	buildEventServer, err := build_event_server.NewBuildEventProtocolServer(env)
-	require.NoError(t, err, "could not set up BuildEventProtocolServer")
 	env.SetBuildEventHandler(build_event_handler.NewBuildEventHandler(env))
 
 	if opts.EnvModifier != nil {
 		opts.EnvModifier(env.TestEnv)
 	}
+
+	scheduler, err := scheduler_server.NewSchedulerServerWithOptions(env, &opts.SchedulerServerOptions)
+	require.NoError(t, err, "could not set up SchedulerServer")
+	buildEventServer, err := build_event_server.NewBuildEventProtocolServer(env)
+	require.NoError(t, err, "could not set up BuildEventProtocolServer")
+	buildBuddyServiceServer, err := buildbuddy_server.NewBuildBuddyServer(env, nil /*=sslService*/)
+	require.NoError(t, err, "could not set up BuildBuddyServiceServer")
 
 	server := &BuildBuddyServer{
 		t:                       t,
@@ -378,6 +441,8 @@ type ExecutorOptions struct {
 	Name string
 	// Optional API key to be sent by executor
 	APIKey string
+	// Optional Pool name for the executor
+	Pool string
 	// Optional server to be used for task leasing, cache requests, etc
 	// If not specified the executor will connect to a random server.
 	Server                       *BuildBuddyServer
@@ -386,15 +451,24 @@ type ExecutorOptions struct {
 
 // Executor is a handle for a running executor instance.
 type Executor struct {
+	env                *testenv.TestEnv
 	hostPort           string
 	grpcServer         *grpc.Server
 	cancelRegistration context.CancelFunc
+	taskScheduler      *priority_task_scheduler.PriorityTaskScheduler
 }
 
 // Stop unregisters the executor from the BuildBuddy server.
 func (e *Executor) stop() {
-	e.grpcServer.Stop()
-	e.cancelRegistration()
+	e.env.GetHealthChecker().Shutdown()
+	e.env.GetHealthChecker().WaitForGracefulShutdown()
+}
+
+// ShutdownTaskScheduler stops the task scheduler from de-queueing any more work.
+func (e *Executor) ShutdownTaskScheduler() {
+	ctx, cancel := context.WithTimeout(context.Background(), defaultWaitTimeout)
+	defer cancel()
+	e.taskScheduler.Shutdown(ctx)
 }
 
 func (r *Env) AddBuildBuddyServer() *BuildBuddyServer {
@@ -412,6 +486,8 @@ func (r *Env) AddBuildBuddyServerWithOptions(opts *BuildBuddyServerOptions) *Bui
 	env := &buildBuddyServerEnv{TestEnv: enterprise_testenv.GetCustomTestEnv(r.t, envOpts), rbeEnv: r}
 	// We're using an in-memory SQLite database so we need to make sure all servers share the same handle.
 	env.SetDBHandle(r.testEnv.GetDBHandle())
+	env.SetUserDB(r.testEnv.GetUserDB())
+	env.SetInvocationDB(r.testEnv.GetInvocationDB())
 
 	server := newBuildBuddyServer(r.t, env, opts)
 	r.buildBuddyServers = append(r.buildBuddyServers, server)
@@ -455,7 +531,7 @@ func (r *Env) AddSingleTaskExecutorWithOptions(options *ExecutorOptions) *Execut
 // otherwise use AddSingleTaskExecutorWithOptions and specify a custom Name.
 // Blocks until executor registers with the scheduler.
 func (r *Env) AddSingleTaskExecutor() *Executor {
-	name := fmt.Sprintf("unnamedExecutor%d(single task)", atomic.AddUint64(&r.executorNameCounter, 1))
+	name := fmt.Sprintf("unnamedExecutor%d_singleTask", atomic.AddUint64(&r.executorNameCounter, 1))
 	return r.AddSingleTaskExecutorWithOptions(&ExecutorOptions{Name: name})
 }
 
@@ -497,18 +573,24 @@ func (r *Env) addExecutor(options *ExecutorOptions) *Executor {
 	}
 
 	env := enterprise_testenv.GetCustomTestEnv(r.t, r.envOpts)
-	r.t.Cleanup(func() {
-		env.GetHealthChecker().Shutdown()
-		log.Infof("Waiting for executor %q to shut down.", options.Name)
-		env.GetHealthChecker().WaitForGracefulShutdown()
-		log.Infof("Shut down for executor %q completed.", options.Name)
-	})
 
 	env.SetRemoteExecutionClient(repb.NewExecutionClient(clientConn))
 	env.SetSchedulerClient(scpb.NewSchedulerClient(clientConn))
 	env.SetAuthenticator(r.newTestAuthenticator())
 
+	bundleFS, err := bundle.Get()
+	require.NoError(r.t, err)
+	env.SetFileResolver(fileresolver.New(bundleFS, "enterprise"))
+	err = resources.Configure(env)
+	require.NoError(r.t, err)
+
 	executorConfig := env.GetConfigurator().GetExecutorConfig()
+	executorConfig.Pool = options.Pool
+	// Place executor data under the env root dir, since that dir gets removed
+	// only after all the executors have shutdown.
+	executorConfig.RootDirectory = filepath.Join(r.rootDataDir, filepath.Join(options.Name, "builds"))
+	executorConfig.LocalCacheDirectory = filepath.Join(r.rootDataDir, filepath.Join(options.Name, "filecache"))
+
 	fc, err := filecache.NewFileCache(executorConfig.LocalCacheDirectory, executorConfig.LocalCacheSizeBytes)
 	if err != nil {
 		assert.FailNow(r.t, "create file cache", err)
@@ -547,6 +629,9 @@ func (r *Env) addExecutor(options *ExecutorOptions) *Executor {
 	executorUUID, err := guuid.NewRandom()
 	require.NoError(r.t, err)
 	executorID := executorUUID.String()
+	if options.Name != "" {
+		executorID = options.Name
+	}
 
 	exec, err := executor.NewExecutor(env, executorID, &executor.Options{NameOverride: options.Name})
 	if err != nil {
@@ -561,6 +646,7 @@ func (r *Env) addExecutor(options *ExecutorOptions) *Executor {
 		assert.FailNowf(r.t, fmt.Sprintf("could not listen on port %d", executorPort), err.Error())
 	}
 	executorGRPCServer, execRunFunc := env.GRPCServer(execLis)
+	env.GetHealthChecker().RegisterShutdownFunction(grpc_server.GRPCShutdownFunc(executorGRPCServer))
 
 	scpb.RegisterQueueExecutorServer(executorGRPCServer, taskScheduler)
 
@@ -581,9 +667,11 @@ func (r *Env) addExecutor(options *ExecutorOptions) *Executor {
 	registration.Start(ctx)
 
 	executor := &Executor{
+		env:                env,
 		hostPort:           fmt.Sprintf("localhost:%d", executorPort),
 		grpcServer:         executorGRPCServer,
 		cancelRegistration: cancel,
+		taskScheduler:      taskScheduler,
 	}
 	r.executors[executor.hostPort] = executor
 	return executor
@@ -592,9 +680,17 @@ func (r *Env) addExecutor(options *ExecutorOptions) *Executor {
 func (r *Env) newTestAuthenticator() *testauth.TestAuthenticator {
 	users := testauth.TestUsers(r.UserID1, r.GroupID1)
 	users[ExecutorAPIKey] = &testauth.TestUser{
-		GroupID:       ExecutorGroup,
-		AllowedGroups: []string{ExecutorGroup},
-		Capabilities:  []akpb.ApiKey_Capability{akpb.ApiKey_REGISTER_EXECUTOR_CAPABILITY},
+		GroupID:       r.ExecutorGroupID,
+		AllowedGroups: []string{r.ExecutorGroupID},
+		// TODO(bduffany): Replace `role.Admin` below with `role.Default` since API
+		// keys cannot have admin rights in practice. This is needed because some
+		// tests perform some RPCs which require admin rights, and we'll need to
+		// either (a) refactor those tests to authenticate as an admin user, or (b)
+		// make it legitimately possible for an API key to have admin role.
+		GroupMemberships: []*interfaces.GroupMembership{
+			{GroupID: r.ExecutorGroupID, Role: role.Admin},
+		},
+		Capabilities: []akpb.ApiKey_Capability{akpb.ApiKey_REGISTER_EXECUTOR_CAPABILITY},
 	}
 	return testauth.NewTestAuthenticator(users)
 }
@@ -628,13 +724,13 @@ func (r *Env) waitForExecutorRegistration() {
 		client := r.GetBuildBuddyServiceClient()
 		req := &scpb.GetExecutionNodesRequest{
 			RequestContext: &ctxpb.RequestContext{
-				GroupId: ExecutorGroup,
+				GroupId: r.ExecutorGroupID,
 			},
 		}
-		nodes, err := client.GetExecutionNodes(ctx, req)
+		rsp, err := client.GetExecutionNodes(ctx, req)
 		require.NoError(r.t, err)
-		for _, node := range nodes.GetExecutionNode() {
-			nodesByHostIp[fmt.Sprintf("%s:%d", node.Host, node.Port)] = true
+		for _, e := range rsp.GetExecutor() {
+			nodesByHostIp[fmt.Sprintf("%s:%d", e.Node.Host, e.Node.Port)] = true
 		}
 		if reflect.DeepEqual(expectedNodesByHostIp, nodesByHostIp) {
 			return
@@ -672,38 +768,57 @@ type CommandResult struct {
 	Stderr string
 }
 
-// Wait blocks until the command has finished executing.
-func (c *Command) Wait() *CommandResult {
+// getResult blocks until the command either finishes executing or encounters
+// an execution error. It fails the test immediately if an error occurs that
+// is not a remote execution error.
+func (c *Command) getResult() (*CommandResult, error) {
 	timeout := time.NewTimer(defaultWaitTimeout)
 	for {
 		select {
-		case status, ok := <-c.StatusChannel():
+		case result, ok := <-c.StatusChannel():
 			if !ok {
 				assert.FailNow(c.env.t, fmt.Sprintf("command %q did not send a result", c.Name))
 			}
-			if status.Stage != repb.ExecutionStage_COMPLETED {
+			if result.Stage != repb.ExecutionStage_COMPLETED {
 				continue
 			}
 			timeout.Stop()
-			if status.Err != nil {
-				assert.FailNowf(c.env.t, fmt.Sprintf("command %q did not finish succesfully", c.Name), status.Err.Error())
+			if result.Err != nil {
+				return nil, result.Err
 			}
 			ctx := context.Background()
 			ctx = c.env.WithUserID(ctx, c.userID)
-			stdout, stderr, err := c.rbeClient.GetStdoutAndStderr(ctx, status)
+			stdout, stderr, err := c.rbeClient.GetStdoutAndStderr(ctx, result)
 			if err != nil {
 				assert.FailNowf(c.env.t, "could not fetch outputs", err.Error())
 			}
 			return &CommandResult{
-				CommandResult: status,
+				CommandResult: result,
 				Stdout:        stdout,
 				Stderr:        stderr,
-			}
+			}, nil
 		case <-timeout.C:
 			assert.FailNow(c.env.t, fmt.Sprintf("command %q did not finish within timeout", c.Name))
-			return nil
+			return nil, nil
 		}
 	}
+}
+
+// Wait blocks until the command has finished executing.
+func (c *Command) Wait() *CommandResult {
+	result, err := c.getResult()
+	require.NoError(c.env.t, err)
+	return result
+}
+
+// MustFail asserts that the command encounters an execution error, and returns
+// the resulting error. Note that if the command runs to completion and returns
+// a non-zero exit code, this is considered a successful execution, not an
+// execution error.
+func (c *Command) MustFail() error {
+	_, err := c.getResult()
+	require.Error(c.env.t, err)
+	return err
 }
 
 func (c *Command) WaitAccepted() {
@@ -799,6 +914,11 @@ type ExecuteOpts struct {
 	InputRootDir string
 	// UserID is the ID of the authenticated user that should execute the command.
 	UserID string
+	// RemoteHeaders is a set of remote headers to append to the outgoing gRPC
+	// context when executing the command.
+	RemoteHeaders map[string]string
+	// If true, the command will reference a missing input root digest.
+	SimulateMissingDigest bool
 }
 
 func (r *Env) Execute(command *repb.Command, opts *ExecuteOpts) *Command {
@@ -806,17 +926,24 @@ func (r *Env) Execute(command *repb.Command, opts *ExecuteOpts) *Command {
 	if opts.UserID != "" {
 		ctx = r.WithUserID(ctx, opts.UserID)
 	}
-
 	ctx, err := prefix.AttachUserPrefixToContext(ctx, r.testEnv)
 	if err != nil {
 		assert.FailNowf(r.t, "could not attach user prefix", err.Error())
 	}
+	for header, value := range opts.RemoteHeaders {
+		ctx = metadata.AppendToOutgoingContext(ctx, header, value)
+	}
 
 	var inputRootDigest *repb.Digest
-	if opts.InputRootDir != "" {
-		inputRootDigest = r.uploadInputRoot(ctx, opts.InputRootDir)
+	if opts.SimulateMissingDigest {
+		// Generate a digest, but don't upload it.
+		inputRootDigest, _ = testdigest.NewRandomDigestBuf(r.t, 1234)
 	} else {
-		inputRootDigest = r.setupRootDirectoryWithTestCommandBinary(ctx)
+		if opts.InputRootDir != "" {
+			inputRootDigest = r.uploadInputRoot(ctx, opts.InputRootDir)
+		} else {
+			inputRootDigest = r.setupRootDirectoryWithTestCommandBinary(ctx)
+		}
 	}
 
 	name := strings.Join(command.GetArguments(), " ")

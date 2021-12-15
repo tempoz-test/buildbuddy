@@ -8,6 +8,8 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"syscall"
+	"time"
 
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/auth"
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/backends/gcs_cache"
@@ -19,6 +21,7 @@ import (
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/remote_execution/filecache"
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/scheduling/priority_task_scheduler"
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/scheduling/scheduler_client"
+	"github.com/buildbuddy-io/buildbuddy/enterprise/server/selfauth"
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/util/redisutil"
 	"github.com/buildbuddy-io/buildbuddy/server/config"
 	"github.com/buildbuddy-io/buildbuddy/server/environment"
@@ -27,20 +30,23 @@ import (
 	"github.com/buildbuddy-io/buildbuddy/server/remote_cache/action_cache_server"
 	"github.com/buildbuddy-io/buildbuddy/server/remote_cache/byte_stream_server"
 	"github.com/buildbuddy-io/buildbuddy/server/remote_cache/content_addressable_storage_server"
+	"github.com/buildbuddy-io/buildbuddy/server/resources"
+	"github.com/buildbuddy-io/buildbuddy/server/util/fileresolver"
 	"github.com/buildbuddy-io/buildbuddy/server/util/grpc_client"
 	"github.com/buildbuddy-io/buildbuddy/server/util/grpc_server"
 	"github.com/buildbuddy-io/buildbuddy/server/util/healthcheck"
 	"github.com/buildbuddy-io/buildbuddy/server/util/log"
 	"github.com/buildbuddy-io/buildbuddy/server/util/monitoring"
+	"github.com/buildbuddy-io/buildbuddy/server/util/status"
 	"github.com/buildbuddy-io/buildbuddy/server/util/tracing"
 	"github.com/buildbuddy-io/buildbuddy/server/xcode"
-
 	"github.com/google/uuid"
 	"google.golang.org/api/option"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/connectivity"
 	"google.golang.org/grpc/test/bufconn"
 
+	bundle "github.com/buildbuddy-io/buildbuddy/enterprise"
 	repb "github.com/buildbuddy-io/buildbuddy/proto/remote_execution"
 	scpb "github.com/buildbuddy-io/buildbuddy/proto/scheduler"
 	bspb "google.golang.org/genproto/googleapis/bytestream"
@@ -89,6 +95,8 @@ func InitializeCacheClientsOrDie(cacheTarget string, realEnv *real_environment.R
 				connState := conn.GetState()
 				if connState == connectivity.Ready {
 					return nil
+				} else if connState == connectivity.Idle {
+					conn.Connect()
 				}
 				return fmt.Errorf("gRPC connection not yet ready (state: %s)", connState)
 			},
@@ -108,14 +116,38 @@ func GetConfiguredEnvironmentOrDie(configurator *config.Configurator, healthChec
 		log.Fatal("Executor config not found")
 	}
 
-	authenticator, err := auth.NewOpenIDAuthenticator(context.Background(), realEnv)
+	if executorConfig.Pool != "" && resources.GetPoolName() != "" {
+		log.Fatal("Only one of the `MY_POOL` environment variable and `executor.pool` config option may be set")
+	}
+	if err := resources.Configure(realEnv); err != nil {
+		log.Fatal(status.Message(err))
+	}
+
+	bundleFS, err := bundle.Get()
+	if err != nil {
+		log.Fatalf("Failed to initialize bundle: %s", err)
+	}
+	realEnv.SetFileResolver(fileresolver.New(bundleFS, "enterprise"))
+
+	authConfigs := realEnv.GetConfigurator().GetAuthOauthProviders()
+	if realEnv.GetConfigurator().GetSelfAuthEnabled() {
+		authConfigs = append(
+			authConfigs,
+			selfauth.Provider(realEnv),
+		)
+	}
+	authenticator, err := auth.NewOpenIDAuthenticator(context.Background(), realEnv, authConfigs)
 	if err == nil {
 		realEnv.SetAuthenticator(authenticator)
 	} else {
 		log.Infof("No authentication will be configured: %s", err)
 	}
 
-	realEnv.SetXCodeLocator(xcode.NewXcodeLocator())
+	xl, err := xcode.NewXcodeLocator()
+	if err != nil {
+		log.Fatalf("Failed to set XCodeLocator: %s", err)
+	}
+	realEnv.SetXCodeLocator(xl)
 
 	if gcsCacheConfig := configurator.GetCacheGCSConfig(); gcsCacheConfig != nil {
 		opts := make([]option.ClientOption, 0)
@@ -179,6 +211,8 @@ func GetConfiguredEnvironmentOrDie(configurator *config.Configurator, healthChec
 					connState := conn.GetState()
 					if connState == connectivity.Ready {
 						return nil
+					} else if connState == connectivity.Idle {
+						conn.Connect()
 					}
 					return fmt.Errorf("gRPC connection not yet ready (state: %s)", connState)
 				},
@@ -196,6 +230,15 @@ func bufDialer(context.Context, string) (net.Conn, error) {
 }
 
 func main() {
+	// The default umask (0022) has the effect of clearing the group-write and
+	// others-write bits when setting up workspace directories, regardless of the
+	// permissions bits passed to mkdir. We want to create these directories with
+	// 0777 permissions in some cases, because we need those to be writable by the
+	// container user, and it is too costly to enable those permissions via
+	// explicit chown or chmod calls on those directories. So, we clear the umask
+	// here to allow group-write and others-write permissions.
+	syscall.Umask(0)
+
 	// Parse all flags, once and for all.
 	flag.Parse()
 	rootContext := context.Background()
@@ -293,7 +336,24 @@ func main() {
 	if err != nil {
 		log.Fatalf("Error initializing executor registration: %s", err)
 	}
-	reg.Start(rootContext)
+
+	warmupDone := make(chan struct{})
+	go func() {
+		executionServer.Warmup()
+		close(warmupDone)
+	}()
+	go func() {
+		if executorConfig.StartupWarmupMaxWaitSecs != 0 {
+			warmupMaxWait := time.Duration(executorConfig.StartupWarmupMaxWaitSecs) * time.Second
+			select {
+			case <-warmupDone:
+			case <-time.After(warmupMaxWait):
+				log.Warningf("Warmup did not finish within %s, resuming startup", warmupMaxWait)
+			}
+		}
+		log.Infof("Registering executor with server.")
+		reg.Start(rootContext)
+	}()
 
 	go func() {
 		localServer.Serve(localListener)

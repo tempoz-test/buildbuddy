@@ -8,11 +8,9 @@ import (
 	"github.com/buildbuddy-io/buildbuddy/server/interfaces"
 	"github.com/buildbuddy-io/buildbuddy/server/tables"
 	"github.com/buildbuddy-io/buildbuddy/server/util/db"
-	"github.com/buildbuddy-io/buildbuddy/server/util/log"
 	"github.com/buildbuddy-io/buildbuddy/server/util/perms"
 	"github.com/buildbuddy-io/buildbuddy/server/util/query_builder"
 	"github.com/buildbuddy-io/buildbuddy/server/util/status"
-	"github.com/buildbuddy-io/buildbuddy/server/util/timeutil"
 
 	aclpb "github.com/buildbuddy-io/buildbuddy/proto/acl"
 	telpb "github.com/buildbuddy-io/buildbuddy/proto/telemetry"
@@ -55,22 +53,27 @@ func (d *InvocationDB) createInvocation(tx *db.DB, ctx context.Context, ti *tabl
 	return tx.Create(ti).Error
 }
 
-func (d *InvocationDB) InsertOrUpdateInvocation(ctx context.Context, ti *tables.Invocation) error {
-	return d.h.Transaction(ctx, func(tx *db.DB) error {
+// InsertOrUpdateInvocation checks whether an invocation with the same primary
+// key as the given invocation exists. If no such invocation exists, it will
+// create a new row with the given invocation properties. Otherwise, it will
+// update the existing invocation. It returns whether a new row was created.
+func (d *InvocationDB) InsertOrUpdateInvocation(ctx context.Context, ti *tables.Invocation) (bool, error) {
+	created := false
+	err := d.h.Transaction(ctx, func(tx *db.DB) error {
 		var existing tables.Invocation
 		if err := tx.Where("invocation_id = ?", ti.InvocationID).First(&existing).Error; err != nil {
-			if db.IsRecordNotFound(err) {
-				return d.createInvocation(tx, ctx, ti)
+			if !db.IsRecordNotFound(err) {
+				return err
 			}
-		} else {
-			err := tx.Model(&existing).Where("invocation_id = ?", ti.InvocationID).Updates(ti).Error
-			if err != nil {
-				log.Warningf("Error updating invocation %s: %s", ti.InvocationID, err.Error())
-				// TODO(tylerw): return an error here!
+			if err := d.createInvocation(tx, ctx, ti); err != nil {
+				return err
 			}
+			created = true
+			return nil
 		}
-		return nil
+		return tx.Model(&existing).Where("invocation_id = ?", ti.InvocationID).Updates(ti).Error
 	})
+	return created, err
 }
 
 func (d *InvocationDB) UpdateInvocationACL(ctx context.Context, authenticatedUser *interfaces.UserInfo, invocationID string, acl *aclpb.ACL) error {
@@ -137,7 +140,7 @@ func (d *InvocationDB) LookupGroupFromInvocation(ctx context.Context, invocation
 }
 
 func (d *InvocationDB) LookupExpiredInvocations(ctx context.Context, cutoffTime time.Time, limit int) ([]*tables.Invocation, error) {
-	cutoffUsec := timeutil.ToUsec(cutoffTime)
+	cutoffUsec := cutoffTime.UnixMicro()
 	rows, err := d.h.Raw(`SELECT * FROM Invocations as i
                                    WHERE i.created_at_usec < ?
                                    LIMIT ?`, cutoffUsec, limit).Rows()
@@ -168,8 +171,8 @@ func (d *InvocationDB) FillCounts(ctx context.Context, stat *telpb.TelemetryStat
 		WHERE 
 			i.created_at_usec >= ? AND
 			i.created_at_usec < ?`,
-		timeutil.ToUsec(time.Now().Truncate(24*time.Hour).Add(-24*time.Hour)),
-		timeutil.ToUsec(time.Now().Truncate(24*time.Hour)))
+		time.Now().Truncate(24*time.Hour).Add(-24*time.Hour).UnixMicro(),
+		time.Now().Truncate(24*time.Hour).UnixMicro())
 
 	if err := counts.Take(stat).Error; err != nil {
 		return err
@@ -200,4 +203,8 @@ func (d *InvocationDB) DeleteInvocationWithPermsCheck(ctx context.Context, authe
 		}
 		return nil
 	})
+}
+
+func (d *InvocationDB) SetNowFunc(now func() time.Time) {
+	d.h.DB.Config.NowFunc = now
 }

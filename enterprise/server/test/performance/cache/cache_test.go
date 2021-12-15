@@ -3,9 +3,7 @@ package cache_test
 import (
 	"context"
 	"fmt"
-	"io/ioutil"
 	"math/rand"
-	"os"
 	"testing"
 	"time"
 
@@ -19,6 +17,7 @@ import (
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testauth"
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testdigest"
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testenv"
+	"github.com/buildbuddy-io/buildbuddy/server/testutil/testfs"
 	"github.com/buildbuddy-io/buildbuddy/server/util/log"
 	"github.com/buildbuddy-io/buildbuddy/server/util/prefix"
 	"github.com/buildbuddy-io/buildbuddy/server/util/testing/flags"
@@ -91,16 +90,7 @@ func getMemoryCache(t testing.TB) interfaces.Cache {
 }
 
 func getDiskCache(t testing.TB, env environment.Env) interfaces.Cache {
-	testRootDir, err := ioutil.TempDir("/tmp", "diskcache_test_*")
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() {
-		err := os.RemoveAll(testRootDir)
-		if err != nil {
-			t.Fatal(err)
-		}
-	})
+	testRootDir := testfs.MakeTempDir(t)
 	dc, err := disk_cache.NewDiskCache(env, &config.DiskConfig{RootDirectory: testRootDir}, maxSizeBytes)
 	if err != nil {
 		t.Fatal(err)
@@ -178,7 +168,7 @@ func benchmarkGetMulti(ctx context.Context, c interfaces.Cache, digestSizeBytes 
 	}
 }
 
-func benchmarkContainsMulti(ctx context.Context, c interfaces.Cache, digestSizeBytes int64, b *testing.B) {
+func benchmarkFindMissing(ctx context.Context, c interfaces.Cache, digestSizeBytes int64, b *testing.B) {
 	digestBufs := makeDigests(b, numDigests, digestSizeBytes)
 	setDigestsInCache(b, ctx, c, digestBufs)
 	digests := make([]*repb.Digest, 0, len(digestBufs))
@@ -190,7 +180,7 @@ func benchmarkContainsMulti(ctx context.Context, c interfaces.Cache, digestSizeB
 	b.ResetTimer()
 
 	for i := 0; i < b.N; i++ {
-		_, err := c.ContainsMulti(ctx, digests)
+		_, err := c.FindMissing(ctx, digests)
 		if err != nil {
 			b.Fatal(err)
 		}
@@ -263,7 +253,7 @@ func BenchmarkGetMulti(b *testing.B) {
 	}
 }
 
-func BenchmarkContainsMulti(b *testing.B) {
+func BenchmarkFindMissing(b *testing.B) {
 	sizes := []int64{10, 100, 1000, 10000}
 	te := testenv.GetTestEnv(b)
 	ctx := getAnonContext(b, te)
@@ -272,7 +262,7 @@ func BenchmarkContainsMulti(b *testing.B) {
 		for _, size := range sizes {
 			name := fmt.Sprintf("%s%d", cache.Name, size)
 			b.Run(name, func(b *testing.B) {
-				benchmarkContainsMulti(ctx, cache, size, b)
+				benchmarkFindMissing(ctx, cache, size, b)
 			})
 		}
 	}

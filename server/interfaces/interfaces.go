@@ -9,6 +9,7 @@ import (
 
 	"github.com/buildbuddy-io/buildbuddy/server/tables"
 	"github.com/buildbuddy-io/buildbuddy/server/util/alert"
+	"github.com/buildbuddy-io/buildbuddy/server/util/role"
 
 	aclpb "github.com/buildbuddy-io/buildbuddy/proto/acl"
 	apipb "github.com/buildbuddy-io/buildbuddy/proto/api/v1"
@@ -18,11 +19,18 @@ import (
 	inpb "github.com/buildbuddy-io/buildbuddy/proto/invocation"
 	pepb "github.com/buildbuddy-io/buildbuddy/proto/publish_build_event"
 	repb "github.com/buildbuddy-io/buildbuddy/proto/remote_execution"
+	rnpb "github.com/buildbuddy-io/buildbuddy/proto/runner"
 	scpb "github.com/buildbuddy-io/buildbuddy/proto/scheduler"
 	telpb "github.com/buildbuddy-io/buildbuddy/proto/telemetry"
 	usagepb "github.com/buildbuddy-io/buildbuddy/proto/usage"
 	wfpb "github.com/buildbuddy-io/buildbuddy/proto/workflow"
 )
+
+//An interface representing a mux for handling/serving http requests.
+type HttpServeMux interface {
+	Handle(pattern string, handler http.Handler)
+	ServeHTTP(w http.ResponseWriter, r *http.Request)
+}
 
 // An interface representing the user info gleaned from an authorization header.
 type UserToken interface {
@@ -40,10 +48,26 @@ type BasicAuthToken interface {
 	GetPassword() string
 }
 
+// GroupMembership represents a user's membership within a group as well as
+// their role within that group.
+type GroupMembership struct {
+	GroupID string    `json:"group_id"`
+	Role    role.Role `json:"role"`
+}
+
 type UserInfo interface {
 	GetUserID() string
 	GetGroupID() string
+	// GetAllowedGroups returns the IDs of the groups of which the user is a
+	// member.
+	// DEPRECATED: Use GetGroupMemberships instead.
 	GetAllowedGroups() []string
+	// GetGroupMemberships returns the user's group memberships.
+	GetGroupMemberships() []*GroupMembership
+	// IsAdmin returns whether this user is a global administrator, meaning
+	// they can access data across groups. This is not to be confused with the
+	// concept of group admin, which grants full access only within a single
+	// group.
 	IsAdmin() bool
 	HasCapability(akpb.ApiKey_Capability) bool
 	GetUseGroupOwnedExecutors() bool
@@ -101,16 +125,24 @@ type Authenticator interface {
 	AuthenticatedUser(ctx context.Context) (UserInfo, error)
 
 	// Parses and returns a BuildBuddy API key from the given string.
-	ParseAPIKeyFromString(string) string
+	ParseAPIKeyFromString(string) (string, error)
 
 	// Returns a context containing the given API key.
 	AuthContextFromAPIKey(ctx context.Context, apiKey string) context.Context
+
+	// TrustedJWTFromAuthContext returns a JWT from the authenticated context,
+	// or empty string if the context is not authenticated.
+	TrustedJWTFromAuthContext(ctx context.Context) string
+
+	// AuthContextFromTrustedJWT returns an authenticated context using a JWT
+	// which has been previously authenticated.
+	AuthContextFromTrustedJWT(ctx context.Context, jwt string) context.Context
 }
 
 type BuildEventChannel interface {
-	MarkInvocationDisconnected(ctx context.Context, iid string) error
 	FinalizeInvocation(iid string) error
 	HandleEvent(event *pepb.PublishBuildToolEventStreamRequest) error
+	Close()
 }
 
 type BuildEventHandler interface {
@@ -118,13 +150,15 @@ type BuildEventHandler interface {
 }
 
 // A Blobstore must allow for reading, writing, and deleting blobs.
-// Implementations should return "os"-compatible package type errors, for
-// example, if a file does not exist on Read, the blobstore should return an
-// "os.ErrNotExist" error.
 type Blobstore interface {
 	BlobExists(ctx context.Context, blobName string) (bool, error)
 	ReadBlob(ctx context.Context, blobName string) ([]byte, error)
 	WriteBlob(ctx context.Context, blobName string, data []byte) (int, error)
+
+	// DeleteBlob does not return an error if the blob does not exist; some
+	// blobstores do not distinguish on return between deleting an existing blob
+	// and calling delete on a non-existent blob, so this is the only way to
+	// provide a consistent interface.
 	DeleteBlob(ctx context.Context, blobName string) error
 }
 
@@ -160,7 +194,7 @@ type Cache interface {
 
 	// Normal cache-like operations.
 	Contains(ctx context.Context, d *repb.Digest) (bool, error)
-	ContainsMulti(ctx context.Context, digests []*repb.Digest) (map[*repb.Digest]bool, error)
+	FindMissing(ctx context.Context, digests []*repb.Digest) ([]*repb.Digest, error)
 	Get(ctx context.Context, d *repb.Digest) ([]byte, error)
 	GetMulti(ctx context.Context, digests []*repb.Digest) (map[*repb.Digest][]byte, error)
 	Set(ctx context.Context, d *repb.Digest, data []byte) error
@@ -174,7 +208,7 @@ type Cache interface {
 
 type InvocationDB interface {
 	// Invocations API
-	InsertOrUpdateInvocation(ctx context.Context, in *tables.Invocation) error
+	InsertOrUpdateInvocation(ctx context.Context, in *tables.Invocation) (bool, error)
 	UpdateInvocationACL(ctx context.Context, authenticatedUser *UserInfo, invocationID string, acl *aclpb.ACL) error
 	LookupInvocation(ctx context.Context, invocationID string) (*tables.Invocation, error)
 	LookupGroupFromInvocation(ctx context.Context, invocationID string) (*tables.Group, error)
@@ -182,6 +216,7 @@ type InvocationDB interface {
 	DeleteInvocation(ctx context.Context, invocationID string) error
 	DeleteInvocationWithPermsCheck(ctx context.Context, authenticatedUser *UserInfo, invocationID string) error
 	FillCounts(ctx context.Context, log *telpb.TelemetryStat) error
+	SetNowFunc(now func() time.Time)
 }
 
 type APIKeyGroup interface {
@@ -272,6 +307,10 @@ type WorkflowService interface {
 	ServeHTTP(w http.ResponseWriter, r *http.Request)
 }
 
+type RunnerService interface {
+	Run(ctx context.Context, req *rnpb.RunRequest) (*rnpb.RunResponse, error)
+}
+
 type GitProviders []GitProvider
 
 type GitProvider interface {
@@ -296,6 +335,10 @@ type GitProvider interface {
 
 	// UnregisterWebhook unregisters the webhook with the given ID from the repo.
 	UnregisterWebhook(ctx context.Context, accessToken, repoURL, webhookID string) error
+
+	// GetFileContents fetches a single file's contents from the repo. It returns
+	// status.NotFoundError if the file does not exist.
+	GetFileContents(ctx context.Context, accessToken, repoURL, filePath, ref string) ([]byte, error)
 
 	// TODO(bduffany): CreateStatus, ListRepos
 }
@@ -348,11 +391,12 @@ type RemoteExecutionService interface {
 	Execute(req *repb.ExecuteRequest, stream repb.Execution_ExecuteServer) error
 	WaitExecution(req *repb.WaitExecutionRequest, stream repb.Execution_WaitExecutionServer) error
 	PublishOperation(stream repb.Execution_PublishOperationServer) error
+	MarkExecutionFailed(ctx context.Context, taskID string, reason error) error
 }
 
 type FileCache interface {
-	FastLinkFile(d *repb.Digest, outputPath string) bool
-	AddFile(d *repb.Digest, existingFilePath string)
+	FastLinkFile(f *repb.FileNode, outputPath string) bool
+	AddFile(f *repb.FileNode, existingFilePath string)
 	WaitForDirectoryScanToComplete()
 }
 
@@ -450,20 +494,21 @@ type PubSub interface {
 //
 // No guarantees are made about durability of MetricsCollectors -- they may be
 // evicted from the backing store that maintains them (usually memcache or
-// redis), so they should *not* be used in critical path code.
+// redis), so they should *not* be used for data that requires durability.
 type MetricsCollector interface {
-	IncrementCount(ctx context.Context, counterName string, n int64) (int64, error)
-	ReadCount(ctx context.Context, counterName string) (int64, error)
+	IncrementCount(ctx context.Context, key, field string, n int64) error
+	ReadCounts(ctx context.Context, key string) (map[string]int64, error)
+	Delete(ctx context.Context, key string) error
 }
 
 // A KeyValStore allows for storing ephemeral values globally.
 //
-// No guarantees are made about durability of KEyValStores -- they may be
+// No guarantees are made about durability of KeyValStores -- they may be
 // evicted from the backing store that maintains them (usually memcache or
 // redis), so they should *not* be used in critical path code.
 type KeyValStore interface {
-	SetByKey(ctx context.Context, key string, val []byte) error
-	GetByKey(ctx context.Context, key string) ([]byte, error)
+	Set(ctx context.Context, key string, val []byte) error
+	Get(ctx context.Context, key string) ([]byte, error)
 }
 
 // A RepoDownloader allows testing a git-repo to see if it's downloadable.
@@ -528,6 +573,10 @@ type LRU interface {
 	// Inserts a value into the LRU. A boolean is returned that indicates
 	// if the value was successfully added.
 	Add(key, value interface{}) bool
+
+	// Inserts a value into the back of the LRU. A boolean is returned that
+	// indicates if the value was successfully added.
+	PushBack(key, value interface{}) bool
 
 	// Gets a value from the LRU, returns a boolean indicating if the value
 	// was present.

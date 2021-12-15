@@ -76,6 +76,114 @@ func TestParse_ContainerImage_Error(t *testing.T) {
 	}
 }
 
+func TestParse_OS(t *testing.T) {
+	for _, testCase := range []struct {
+		rawValue      string
+		expectedValue string
+	}{
+		{"", "linux"},
+		{"linux", "linux"},
+		{"darwin", "darwin"},
+	} {
+		plat := &repb.Platform{Properties: []*repb.Platform_Property{
+			{Name: "OSFamily", Value: testCase.rawValue},
+		}}
+		platformProps := platform.ParseProperties(&repb.ExecutionTask{Command: &repb.Command{Platform: plat}})
+		assert.Equal(t, testCase.expectedValue, platformProps.OS)
+	}
+
+	// Empty case
+	plat := &repb.Platform{Properties: []*repb.Platform_Property{}}
+	platformProps := platform.ParseProperties(&repb.ExecutionTask{Command: &repb.Command{Platform: plat}})
+	assert.Equal(t, "linux", platformProps.OS)
+}
+
+func TestParse_Arch(t *testing.T) {
+	for _, testCase := range []struct {
+		rawValue      string
+		expectedValue string
+	}{
+		{"", "amd64"},
+		{"amd64", "amd64"},
+		{"arm64", "arm64"},
+	} {
+		plat := &repb.Platform{Properties: []*repb.Platform_Property{
+			{Name: "Arch", Value: testCase.rawValue},
+		}}
+		platformProps := platform.ParseProperties(&repb.ExecutionTask{Command: &repb.Command{Platform: plat}})
+		assert.Equal(t, testCase.expectedValue, platformProps.Arch)
+	}
+
+	// Empty case
+	plat := &repb.Platform{Properties: []*repb.Platform_Property{}}
+	platformProps := platform.ParseProperties(&repb.ExecutionTask{Command: &repb.Command{Platform: plat}})
+	assert.Equal(t, "amd64", platformProps.Arch)
+}
+
+func TestParse_Pool(t *testing.T) {
+	for _, testCase := range []struct {
+		rawValue      string
+		expectedValue string
+	}{
+		{"", ""},
+		{"default", ""},
+		{"my-pool", "my-pool"},
+	} {
+		plat := &repb.Platform{Properties: []*repb.Platform_Property{
+			{Name: "Pool", Value: testCase.rawValue},
+		}}
+		platformProps := platform.ParseProperties(&repb.ExecutionTask{Command: &repb.Command{Platform: plat}})
+		assert.Equal(t, testCase.expectedValue, platformProps.Pool)
+	}
+
+	// Empty case
+	plat := &repb.Platform{Properties: []*repb.Platform_Property{}}
+	platformProps := platform.ParseProperties(&repb.ExecutionTask{Command: &repb.Command{Platform: plat}})
+	assert.Equal(t, "", platformProps.Pool)
+}
+
+func TestParse_EstimatedBCU(t *testing.T) {
+	for _, testCase := range []struct {
+		name          string
+		rawValue      string
+		expectedValue int64
+	}{
+		{"EstimatedComputeUnits", "", 0},
+		{"EstimatedComputeUnits", "NOT_AN_INT", 0},
+		{"EstimatedComputeUnits", "0", 0},
+		{"EstimatedComputeUnits", "1", 1},
+		{"EstimatedComputeUnits", " 1 ", 1},
+		{"estimatedcomputeunits", "1", 1},
+	} {
+		plat := &repb.Platform{Properties: []*repb.Platform_Property{
+			{Name: testCase.name, Value: testCase.rawValue},
+		}}
+		platformProps := platform.ParseProperties(&repb.ExecutionTask{Command: &repb.Command{Platform: plat}})
+		assert.Equal(t, testCase.expectedValue, platformProps.EstimatedComputeUnits)
+	}
+}
+
+func TestParse_EstimatedFreeDisk(t *testing.T) {
+	for _, testCase := range []struct {
+		name          string
+		rawValue      string
+		expectedValue int64
+	}{
+		{"EstimatedFreeDiskBytes", "", 0},
+		{"EstimatedFreeDiskBytes", "NOT_AN_INT", 0},
+		{"EstimatedFreeDiskBytes", "0", 0},
+		{"EstimatedFreeDiskBytes", "1", 1},
+		{"EstimatedFreeDiskBytes", " 1 ", 1},
+		{"estimatedfreediskbytes", "1", 1},
+	} {
+		plat := &repb.Platform{Properties: []*repb.Platform_Property{
+			{Name: testCase.name, Value: testCase.rawValue},
+		}}
+		platformProps := platform.ParseProperties(&repb.ExecutionTask{Command: &repb.Command{Platform: plat}})
+		assert.Equal(t, testCase.expectedValue, platformProps.EstimatedFreeDiskBytes)
+	}
+}
+
 func TestParse_ApplyOverrides(t *testing.T) {
 	for _, testCase := range []struct {
 		platformProps       []*repb.Platform_Property

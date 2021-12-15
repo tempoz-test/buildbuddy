@@ -8,6 +8,9 @@ import (
 // assigning multiple roles to users and use these as bitmasks to check
 // role membership.
 const (
+	// None means that the user is not granted any role-based permissions for
+	// a particular group.
+	None Role = 0
 	// Developer means a user cannot perform certain privileged actions such
 	// as creating API keys and viewing usage data, but can perform most other
 	// common actions such as viewing invocation history.
@@ -17,10 +20,7 @@ const (
 
 	// DefaultRole is the role assigned to users when joining a group they did
 	// not create.
-	// TODO(bduffany): Change this to DeveloperRole once we have a way to manage
-	// roles via the UI (otherwise, there would be no easy way to promote new
-	// users to admins in the meantime).
-	Default = Admin
+	Default = Developer
 )
 
 // Role represents a user's role within a group.

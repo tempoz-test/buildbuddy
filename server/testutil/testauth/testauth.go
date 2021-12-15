@@ -9,8 +9,8 @@ import (
 	"github.com/buildbuddy-io/buildbuddy/server/tables"
 	"github.com/buildbuddy-io/buildbuddy/server/util/capabilities"
 	"github.com/buildbuddy-io/buildbuddy/server/util/log"
+	"github.com/buildbuddy-io/buildbuddy/server/util/role"
 	"github.com/buildbuddy-io/buildbuddy/server/util/status"
-
 	"github.com/dgrijalva/jwt-go"
 	"google.golang.org/grpc/metadata"
 
@@ -38,23 +38,25 @@ const (
 )
 
 var (
-	testApiKeyRegex = regexp.MustCompile(APIKeyHeader + "=([a-zA-Z0-9]+)")
+	testApiKeyRegex = regexp.MustCompile(APIKeyHeader + "=([a-zA-Z0-9]*)")
 	jwtTestKey      = []byte("testKey")
 )
 
 type TestUser struct {
 	jwt.StandardClaims
-	UserID                 string                   `json:"user_id"`
-	GroupID                string                   `json:"group_id"`
-	AllowedGroups          []string                 `json:"allowed_groups"`
-	Capabilities           []akpb.ApiKey_Capability `json:"capabilities"`
-	UseGroupOwnedExecutors bool                     `json:"use_group_owned_executors,omitempty"`
+	UserID                 string                        `json:"user_id"`
+	GroupID                string                        `json:"group_id"`
+	AllowedGroups          []string                      `json:"allowed_groups"`
+	GroupMemberships       []*interfaces.GroupMembership `json:"group_memberships"`
+	Capabilities           []akpb.ApiKey_Capability      `json:"capabilities"`
+	UseGroupOwnedExecutors bool                          `json:"use_group_owned_executors,omitempty"`
 }
 
-func (c *TestUser) GetUserID() string          { return c.UserID }
-func (c *TestUser) GetGroupID() string         { return c.GroupID }
-func (c *TestUser) GetAllowedGroups() []string { return c.AllowedGroups }
-func (c *TestUser) IsAdmin() bool              { return false }
+func (c *TestUser) GetUserID() string                                  { return c.UserID }
+func (c *TestUser) GetGroupID() string                                 { return c.GroupID }
+func (c *TestUser) GetAllowedGroups() []string                         { return c.AllowedGroups }
+func (c *TestUser) GetGroupMemberships() []*interfaces.GroupMembership { return c.GroupMemberships }
+func (c *TestUser) IsAdmin() bool                                      { return false }
 func (c *TestUser) HasCapability(cap akpb.ApiKey_Capability) bool {
 	for _, cc := range c.Capabilities {
 		if cap == cc {
@@ -69,6 +71,8 @@ func (c *TestUser) GetUseGroupOwnedExecutors() bool {
 
 // TestUsers creates a map of test users from arguments of the form:
 // user_id1, group_id1, user_id2, group_id2, ..., user_idN, group_idN
+//
+// All users are created with Admin role within each group, to ease testing of admin-only APIs.
 func TestUsers(vals ...string) map[string]interfaces.UserInfo {
 	if len(vals)%2 != 0 {
 		log.Errorf("You're calling TestUsers wrong!")
@@ -81,6 +85,9 @@ func TestUsers(vals ...string) map[string]interfaces.UserInfo {
 		} else {
 			u.GroupID = val
 			u.AllowedGroups = []string{val}
+			u.GroupMemberships = []*interfaces.GroupMembership{
+				{GroupID: val, Role: role.Admin},
+			}
 			u.Capabilities = capabilities.DefaultAuthenticatedUserCapabilities
 			testUsers[u.UserID] = u
 		}
@@ -164,18 +171,46 @@ func (a *TestAuthenticator) Logout(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, "/", http.StatusTemporaryRedirect)
 }
 
-func (a *TestAuthenticator) ParseAPIKeyFromString(input string) string {
+func (a *TestAuthenticator) ParseAPIKeyFromString(input string) (string, error) {
 	matches := testApiKeyRegex.FindStringSubmatch(input)
-	if matches != nil && len(matches) > 1 {
-		return matches[1]
+	if len(matches) == 0 {
+		// The api key header is not present
+		return "", nil
 	}
-	return ""
+	if len(matches) != 2 {
+		return "", status.FailedPreconditionError("invalid input")
+	}
+	if apiKey := matches[1]; apiKey != "" {
+		return apiKey, nil
+	}
+	return "", status.FailedPreconditionError("missing API Key")
 }
 
 func (a *TestAuthenticator) AuthContextFromAPIKey(ctx context.Context, apiKey string) context.Context {
 	ctx = context.WithValue(ctx, APIKeyHeader, apiKey)
-	ctx = context.WithValue(ctx, testAuthenticationHeader, a.testUsers[apiKey])
+	u := a.testUsers[apiKey]
+	ctx = context.WithValue(ctx, testAuthenticationHeader, u)
+	if u != nil {
+		jwt, err := TestJWTForUserID(u.GetUserID())
+		if err != nil {
+			log.Errorf("failed to create test JWT: %s", err)
+		} else {
+			ctx = context.WithValue(ctx, jwtHeader, jwt)
+		}
+	}
 	return ctx
+}
+
+func (a *TestAuthenticator) TrustedJWTFromAuthContext(ctx context.Context) string {
+	jwt, ok := ctx.Value(jwtHeader).(string)
+	if !ok {
+		return ""
+	}
+	return jwt
+}
+
+func (a *TestAuthenticator) AuthContextFromTrustedJWT(ctx context.Context, jwt string) context.Context {
+	return context.WithValue(ctx, jwtHeader, jwt)
 }
 
 func (a *TestAuthenticator) WithAuthenticatedUser(ctx context.Context, userID string) (context.Context, error) {

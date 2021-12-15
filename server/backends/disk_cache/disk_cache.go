@@ -19,6 +19,7 @@ import (
 	"github.com/buildbuddy-io/buildbuddy/server/config"
 	"github.com/buildbuddy-io/buildbuddy/server/environment"
 	"github.com/buildbuddy-io/buildbuddy/server/interfaces"
+	"github.com/buildbuddy-io/buildbuddy/server/metrics"
 	"github.com/buildbuddy-io/buildbuddy/server/remote_cache/digest"
 	"github.com/buildbuddy-io/buildbuddy/server/util/alert"
 	"github.com/buildbuddy-io/buildbuddy/server/util/disk"
@@ -27,6 +28,7 @@ import (
 	"github.com/buildbuddy-io/buildbuddy/server/util/prefix"
 	"github.com/buildbuddy-io/buildbuddy/server/util/status"
 	"github.com/buildbuddy-io/buildbuddy/server/util/statusz"
+	"github.com/prometheus/client_golang/prometheus"
 	"golang.org/x/sync/errgroup"
 
 	repb "github.com/buildbuddy-io/buildbuddy/proto/remote_execution"
@@ -247,8 +249,8 @@ func (c *DiskCache) Contains(ctx context.Context, d *repb.Digest) (bool, error) 
 	return c.partition.contains(ctx, c.cacheType, c.remoteInstanceName, d)
 }
 
-func (c *DiskCache) ContainsMulti(ctx context.Context, digests []*repb.Digest) (map[*repb.Digest]bool, error) {
-	return c.partition.containsMulti(ctx, c.cacheType, c.remoteInstanceName, digests)
+func (c *DiskCache) FindMissing(ctx context.Context, digests []*repb.Digest) ([]*repb.Digest, error) {
+	return c.partition.findMissing(ctx, c.cacheType, c.remoteInstanceName, digests)
 }
 
 func (c *DiskCache) Get(ctx context.Context, d *repb.Digest) ([]byte, error) {
@@ -305,25 +307,25 @@ type partition struct {
 }
 
 func newPartition(id string, rootDir string, maxSizeBytes int64, useV2Layout bool) (*partition, error) {
-	l, err := lru.NewLRU(&lru.Config{MaxSize: maxSizeBytes, OnEvict: evictFn, SizeFn: sizeFn})
-	if err != nil {
-		return nil, err
-	}
-	c := &partition{
+	p := &partition{
 		id:               id,
 		useV2Layout:      useV2Layout,
 		maxSizeBytes:     maxSizeBytes,
-		lru:              l,
 		rootDir:          rootDir,
 		fileChannel:      make(chan *fileRecord),
 		internedStrings:  make(map[string]string, 0),
 		doneAsyncLoading: make(chan struct{}),
 	}
-	if err := c.initializeCache(); err != nil {
+	l, err := lru.NewLRU(&lru.Config{MaxSize: maxSizeBytes, OnEvict: p.evictFn, SizeFn: sizeFn})
+	if err != nil {
 		return nil, err
 	}
-	c.startJanitor()
-	return c, nil
+	p.lru = l
+	if err := p.initializeCache(); err != nil {
+		return nil, err
+	}
+	p.startJanitor()
+	return p, nil
 }
 
 type fileRecord struct {
@@ -344,12 +346,6 @@ func sizeFn(value interface{}) int64 {
 	return size
 }
 
-func evictFn(value interface{}) {
-	if v, ok := value.(*fileRecord); ok {
-		disk.DeleteFile(context.TODO(), v.FullPath())
-	}
-}
-
 func getLastUse(info os.FileInfo) int64 {
 	stat := info.Sys().(*syscall.Stat_t)
 	// Super Gross! https://github.com/golang/go/issues/31735
@@ -363,6 +359,18 @@ func getLastUse(info os.FileInfo) int64 {
 		ts = syscall.Timespec{}
 	}
 	return time.Unix(ts.Sec, ts.Nsec).UnixNano()
+}
+
+func (p *partition) evictFn(value interface{}) {
+	if v, ok := value.(*fileRecord); ok {
+		i, err := os.Stat(v.FullPath())
+		if err == nil {
+			lastUse := time.Unix(0, getLastUse(i))
+			ageUsec := float64(time.Now().Sub(lastUse).Microseconds())
+			metrics.DiskCacheLastEvictionAgeUsec.With(prometheus.Labels{metrics.PartitionID: p.id}).Set(ageUsec)
+		}
+		disk.DeleteFile(context.TODO(), v.FullPath())
+	}
 }
 
 func (p *partition) internString(s string) string {
@@ -504,15 +512,16 @@ func (p *partition) initializeCache() error {
 			alert.UnexpectedEvent("disk_cache_error_walking_directory", "err: %s", err)
 		}
 
-		// Sort entries by ascending ATime.
-		sort.Slice(records, func(i, j int) bool { return records[i].lastUse < records[j].lastUse })
+		// Sort entries by descending ATime.
+		sort.Slice(records, func(i, j int) bool { return records[i].lastUse > records[j].lastUse })
 
 		p.mu.Lock()
-		// Populate our LRU with everything we scanned from disk.
+		// Populate our LRU with everything we scanned from disk, until the LRU reaches capacity.
 		for _, record := range records {
-			p.lru.Add(record.FullPath(), record)
+			if added := p.lru.PushBack(record.FullPath(), record); !added {
+				break
+			}
 		}
-		records = nil
 
 		// Add in-flight records to the LRU. These were new files
 		// touched during the loading phase, so we assume they are new
@@ -715,6 +724,38 @@ func (p *partition) containsMulti(ctx context.Context, cacheType interfaces.Cach
 	}
 
 	return foundMap, nil
+}
+
+func (p *partition) findMissing(ctx context.Context, cacheType interfaces.CacheType, remoteInstanceName string, digests []*repb.Digest) ([]*repb.Digest, error) {
+	lock := sync.RWMutex{} // protects(missing)
+	var missing []*repb.Digest
+	eg, ctx := errgroup.WithContext(ctx)
+
+	for _, d := range digests {
+		fetchFn := func(d *repb.Digest) {
+			eg.Go(func() error {
+				exists, err := p.contains(ctx, cacheType, remoteInstanceName, d)
+				// NotFoundError is never returned from contains above, so
+				// we don't check for it.
+				if err != nil {
+					return err
+				}
+				if !exists {
+					lock.Lock()
+					missing = append(missing, d)
+					lock.Unlock()
+				}
+				return nil
+			})
+		}
+		fetchFn(d)
+	}
+
+	if err := eg.Wait(); err != nil {
+		return nil, err
+	}
+
+	return missing, nil
 }
 
 func (p *partition) get(ctx context.Context, cacheType interfaces.CacheType, remoteInstanceName string, d *repb.Digest) ([]byte, error) {

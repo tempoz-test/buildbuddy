@@ -15,6 +15,12 @@ export { CancelablePromise } from "../util/async";
  */
 type ExtendedBuildBuddyService = CancelableService<buildbuddy.service.BuildBuddyService>;
 
+/**
+ * BuildBuddyServiceRpcName is a union type consisting of all BuildBuddyService
+ * RPC names (in `camelCase`).
+ */
+export type BuildBuddyServiceRpcName = RpcMethodNames<buildbuddy.service.BuildBuddyService>;
+
 class RpcService {
   service: ExtendedBuildBuddyService;
   events: Subject<string>;
@@ -64,11 +70,17 @@ class RpcService {
         if (this.status >= 200 && this.status < 400) {
           resolve(this.response);
         } else {
-          reject("Error loading file");
+          let message: String;
+          if (this.response instanceof ArrayBuffer) {
+            message = new TextDecoder().decode(this.response);
+          } else {
+            message = String(this.response);
+          }
+          reject("Error loading file: " + message);
         }
       };
       request.onerror = function () {
-        reject("Error loading file");
+        reject("Error loading file (unknown error)");
       };
       request.send();
     });
@@ -86,12 +98,12 @@ class RpcService {
         this.events.next(method.name);
         console.log(`Emitting event [${method.name}]`);
       } else {
-        callback(`Error: ${new TextDecoder("utf-8").decode(new Uint8Array(request.response))}`);
+        callback(new Error(`${new TextDecoder("utf-8").decode(new Uint8Array(request.response))}`));
       }
     };
 
     request.onerror = () => {
-      callback("Error: Connection error");
+      callback(new Error("Connection error"));
     };
 
     request.send(requestData);
@@ -119,6 +131,8 @@ type Rpc<Request, Response> = (request: Request) => Promise<Response>;
 
 type CancelableRpc<Request, Response> = (request: Request) => CancelablePromise<Response>;
 
+type RpcMethodNames<Service> = keyof Omit<Service, keyof protobufjs.rpc.Service>;
+
 /**
  * Utility type that adapts a `PromiseBasedService` so that `CancelablePromise` is
  * returned from all methods, instead of `Promise`.
@@ -127,10 +141,7 @@ type CancelableService<Service extends protobufjs.rpc.Service> = protobufjs.rpc.
   {
     // Loop over all methods in the service, except for the ones inherited from the base
     // service (we don't want to modify those at all).
-    [MethodName in keyof Omit<Service, keyof protobufjs.rpc.Service>]: Service[MethodName] extends Rpc<
-      infer Request,
-      infer Response
-    >
+    [MethodName in RpcMethodNames<Service>]: Service[MethodName] extends Rpc<infer Request, infer Response>
       ? CancelableRpc<Request, Response>
       : never;
   };

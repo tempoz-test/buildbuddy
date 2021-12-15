@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/binary"
+	"encoding/json"
 	"fmt"
 	"io"
 	"math"
@@ -16,7 +17,7 @@ import (
 	"time"
 
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/auth"
-	"github.com/buildbuddy-io/buildbuddy/enterprise/server/remote_execution/casfs"
+	"github.com/buildbuddy-io/buildbuddy/enterprise/server/hostedrunner"
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/remote_execution/commandutil"
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/remote_execution/container"
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/remote_execution/containers/bare"
@@ -24,6 +25,7 @@ import (
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/remote_execution/containers/docker"
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/remote_execution/containers/firecracker"
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/remote_execution/platform"
+	"github.com/buildbuddy-io/buildbuddy/enterprise/server/remote_execution/vfs"
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/remote_execution/workspace"
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/tasksize"
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/util/vfs_server"
@@ -35,6 +37,7 @@ import (
 	"github.com/buildbuddy-io/buildbuddy/server/util/log"
 	"github.com/buildbuddy-io/buildbuddy/server/util/perms"
 	"github.com/buildbuddy-io/buildbuddy/server/util/status"
+	"github.com/golang/protobuf/jsonpb"
 	"github.com/golang/protobuf/proto"
 	"github.com/prometheus/client_golang/prometheus"
 	"golang.org/x/sync/errgroup"
@@ -66,11 +69,14 @@ const (
 	// How long to spend waiting for a runner to be removed before giving up.
 	runnerCleanupTimeout = 30 * time.Second
 	// Allowed time to spend trying to pause a runner and add it to the pool.
-	runnerRecycleTimeout = 15 * time.Second
+	runnerRecycleTimeout = 30 * time.Second
 
 	// How big a runner's workspace is allowed to get before we decide that it
 	// can't be added to the pool and must be cleaned up instead.
 	defaultRunnerDiskSizeLimitBytes = 16e9
+	// How much memory a runner is allowed to use before we decide that it
+	// can't be added to the pool and must be cleaned up instead.
+	defaultRunnerMemoryLimitBytes = tasksize.WorkflowMemEstimate
 	// Memory usage estimate multiplier for pooled runners, relative to the
 	// default memory estimate for execution tasks.
 	runnerMemUsageEstimateMultiplierBytes = 6.5
@@ -79,6 +85,11 @@ const (
 	hitStatusLabel = "hit"
 	// Label assigned to runner pool request count metric for unfulfilled requests.
 	missStatusLabel = "miss"
+
+	// Value for persisent workers that support the JSON persistent worker protocol.
+	workerProtocolJSONValue = "json"
+	// Value for persisent workers that support the protobuf persistent worker protocol.
+	workerProtocolProtobufValue = "proto"
 )
 
 var (
@@ -141,11 +152,13 @@ type CommandRunner struct {
 	Container *container.TracedCommandContainer
 	// Workspace holds the data which is used by this runner.
 	Workspace *workspace.Workspace
-	// CASFS holds the FUSE-backed virtual filesystem, if it's enabled.
-	CASFS *casfs.CASFS
+	// VFS holds the FUSE-backed virtual filesystem, if it's enabled.
+	VFS *vfs.VFS
 	// VFSServer holds the RPC server that serves FUSE filesystem requests.
 	VFSServer *vfs_server.Server
 
+	// task is the current task assigned to the runner.
+	task *repb.ExecutionTask
 	// State is the current state of the runner as it pertains to reuse.
 	state state
 
@@ -156,6 +169,9 @@ type CommandRunner struct {
 	stdoutReader *bufio.Reader
 	// Keeps track of whether or not we encountered any errors that make the runner non-reusable.
 	doNotReuse bool
+
+	// Decoder used when reading streamed JSON values from stdout.
+	jsonDecoder *json.Decoder
 
 	// Cached resource usage values from the last time the runner was added to
 	// the pool.
@@ -168,8 +184,8 @@ func (r *CommandRunner) pullCredentials() container.PullCredentials {
 	return container.GetPullCredentials(r.env, r.PlatformProperties)
 }
 
-func (r *CommandRunner) PrepareForTask(ctx context.Context, task *repb.ExecutionTask) error {
-	r.Workspace.SetTask(task)
+func (r *CommandRunner) PrepareForTask(ctx context.Context) error {
+	r.Workspace.SetTask(r.task)
 	// Clean outputs for the current task if applicable, in case
 	// those paths were written as read-only inputs in a previous action.
 	if r.PlatformProperties.RecycleRunner {
@@ -195,11 +211,14 @@ func (r *CommandRunner) PrepareForTask(ctx context.Context, task *repb.Execution
 	return nil
 }
 
-func (r *CommandRunner) Run(ctx context.Context, command *repb.Command) *interfaces.CommandResult {
+// Run runs the task that is currently bound to the command runner.
+func (r *CommandRunner) Run(ctx context.Context) *interfaces.CommandResult {
 	wsPath := r.Workspace.Path()
-	if r.CASFS != nil {
-		wsPath = r.CASFS.GetMountDir()
+	if r.VFS != nil {
+		wsPath = r.VFS.GetMountDir()
 	}
+
+	command := r.task.GetCommand()
 
 	if !r.PlatformProperties.RecycleRunner {
 		// If the container is not recyclable, then use `Run` to walk through
@@ -236,16 +255,37 @@ func (r *CommandRunner) Run(ctx context.Context, command *repb.Command) *interfa
 	return r.Container.Exec(ctx, command, nil, nil)
 }
 
+// shutdown runs any manual cleanup required to clean up processes before
+// removing a runner from the pool. This has no effect for isolation types
+// that fully isolate all processes started by the runner and remove them
+// automatically via `Container.Remove`.
+func (r *CommandRunner) shutdown(ctx context.Context) error {
+	if r.PlatformProperties.WorkloadIsolationType != string(platform.BareContainerType) {
+		return nil
+	}
+
+	if r.isCIRunner() {
+		if err := r.cleanupCIRunner(ctx); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
 func (r *CommandRunner) Remove(ctx context.Context) error {
 	errs := []error{}
 	if s := r.state; s != initial && s != removed {
 		r.state = removed
+		if err := r.shutdown(ctx); err != nil {
+			errs = append(errs, err)
+		}
 		if err := r.Container.Remove(ctx); err != nil {
 			errs = append(errs, err)
 		}
 	}
-	if r.CASFS != nil {
-		if err := r.CASFS.Unmount(); err != nil {
+	if r.VFS != nil {
+		if err := r.VFS.Unmount(); err != nil {
 			errs = append(errs, err)
 		}
 	}
@@ -274,6 +314,25 @@ func (r *CommandRunner) RemoveInBackground() {
 			log.Errorf("Failed to remove runner: %s", err)
 		}
 	}()
+}
+
+// isCIRunner returns whether the task assigned to this runner is a BuildBuddy
+// CI task.
+func (r *CommandRunner) isCIRunner() bool {
+	args := r.task.GetCommand().GetArguments()
+	return r.PlatformProperties.WorkflowID != "" && len(args) > 0 && args[0] == "./buildbuddy_ci_runner"
+}
+
+func (r *CommandRunner) cleanupCIRunner(ctx context.Context) error {
+	// Run the currently assigned buildbuddy_ci_runner command, appending the
+	// --shutdown_and_exit argument. We use this approach because we want to
+	// preserve the configuration from the last run command, which may include the
+	// configured Bazel path.
+	cleanupCmd := proto.Clone(r.task.GetCommand()).(*repb.Command)
+	cleanupCmd.Arguments = append(cleanupCmd.Arguments, "--shutdown_and_exit")
+
+	res := commandutil.Run(ctx, cleanupCmd, r.Workspace.Path(), nil /*=stdin*/, nil /*=stdout*/)
+	return res.Error
 }
 
 // ACLForUser returns an ACL that grants anyone in the given user's group to
@@ -410,6 +469,13 @@ func (p *Pool) add(ctx context.Context, r *CommandRunner) *labeledError {
 			"stats_failed",
 		}
 	}
+	// If memory usage stats are not implemented, fall back to the task size
+	// estimate.
+	if stats.MemoryUsageBytes == 0 {
+		estimate := tasksize.Estimate(r.task)
+		stats.MemoryUsageBytes = estimate.GetEstimatedMemoryBytes()
+	}
+
 	if stats.MemoryUsageBytes > p.maxRunnerMemoryUsageBytes {
 		return &labeledError{
 			RunnerMaxMemoryExceeded,
@@ -433,17 +499,16 @@ func (p *Pool) add(ctx context.Context, r *CommandRunner) *labeledError {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	if p.pausedRunnerCount() >= p.maxRunnerCount {
-		if p.maxRunnerCount <= 0 {
-			return &labeledError{
-				status.InternalError("pool max runner count is <= 0; this should never happen"),
-				"max_runner_count_zero",
-			}
+	if p.maxRunnerCount <= 0 {
+		return &labeledError{
+			status.InternalError("pool max runner count is <= 0; this should never happen"),
+			"max_runner_count_zero",
 		}
+	}
+
+	for p.pausedRunnerCount() >= p.maxRunnerCount ||
+		p.pausedRunnerMemoryUsageBytes()+stats.MemoryUsageBytes > p.maxRunnerMemoryUsageBytes {
 		// Evict the oldest (first) paused runner to make room for the new one.
-		// Note the two conditionals above imply that
-		// p.pausedRunnerCount() >= p.maxRunnerCount > 0, so there's now at least
-		// 1 paused runner in the list that can be evicted.
 		evictIndex := -1
 		for i, r := range p.runners {
 			if r.state == paused {
@@ -515,12 +580,44 @@ func (p *Pool) dockerOptions() *docker.DockerOptions {
 	}
 }
 
-func (p *Pool) WarmupDefaultImage() {
+func (p *Pool) warmupImage(ctx context.Context, containerType platform.ContainerType, image string) error {
 	start := time.Now()
+	plat := &repb.Platform{
+		Properties: []*repb.Platform_Property{
+			{Name: "container-image", Value: image},
+			{Name: "workload-isolation-type", Value: string(containerType)},
+		},
+	}
+	task := &repb.ExecutionTask{
+		Command: &repb.Command{
+			Arguments: []string{"echo", "'warmup'"},
+			Platform:  plat,
+		},
+	}
+	platProps := platform.ParseProperties(task)
+	c, err := p.newContainer(ctx, platProps, task)
+	if err != nil {
+		log.Errorf("Error warming up %q: %s", containerType, err)
+		return err
+	}
+
+	creds := container.GetPullCredentials(p.env, platProps)
+	err = container.PullImageIfNecessary(
+		ctx, p.env, p.imageCacheAuth,
+		c, creds, platProps.ContainerImage,
+	)
+	if err != nil {
+		return err
+	}
+	log.Infof("Warmup: %s pulled image %q in %s", containerType, image, time.Since(start))
+	return nil
+}
+
+func (p *Pool) WarmupImages() {
 	config := p.env.GetConfigurator().GetExecutorConfig()
 	executorProps := platform.GetExecutorProperties(config)
-	// Give the pull up to 1 minute to succeed and 1 minute to create a warm up container.
-	// In practice I saw clean pulls take about 30 seconds.
+	// Give the pull up to 2 minute to succeed.
+	// In practice warmup take about 30 seconds for docker and 75 seconds for firecracker.
 	timeout := 2 * time.Minute
 	if config.WarmupTimeoutSecs > 0 {
 		timeout = time.Duration(config.WarmupTimeoutSecs) * time.Second
@@ -528,64 +625,29 @@ func (p *Pool) WarmupDefaultImage() {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
-	eg, egCtx := errgroup.WithContext(ctx)
+	eg, ctx := errgroup.WithContext(ctx)
 	for _, containerType := range executorProps.SupportedIsolationTypes {
 		containerType := containerType
 		image := platform.DefaultContainerImage
 		if config.DefaultImage != "" {
 			image = config.DefaultImage
 		}
-		plat := &repb.Platform{
-			Properties: []*repb.Platform_Property{
-				{Name: "container-image", Value: image},
-				{Name: "workload-isolation-type", Value: string(containerType)},
-			},
-		}
-		task := &repb.ExecutionTask{
-			Command: &repb.Command{
-				Arguments: []string{"echo", "'warmup'"},
-				Platform:  plat,
-			},
-		}
-		platProps := platform.ParseProperties(task)
-		c, err := p.newContainer(egCtx, platProps, task.GetCommand())
-		if err != nil {
-			log.Errorf("Error warming up %q: %s", containerType, err)
-			return
-		}
-
 		eg.Go(func() error {
-			creds := container.GetPullCredentials(p.env, platProps)
-			err := container.PullImageIfNecessary(
-				egCtx, p.env, p.imageCacheAuth,
-				c, creds, platProps.ContainerImage,
-			)
-			if err != nil {
-				return err
-			}
-			log.Infof("Warmup: %s pulled default image %q in %s", containerType, image, time.Since(start))
-			tmpDir, err := os.MkdirTemp("", "buildbuddy-warmup-*")
-			if err != nil {
-				return err
-			}
-			defer os.Remove(tmpDir)
-			if err = c.Create(egCtx, tmpDir); err != nil {
-				return err
-			}
-			if err := c.Remove(egCtx); err != nil {
-				return err
-			}
-			log.Infof("Warmup: %s finished in %s.", containerType, time.Since(start))
-			return nil
+			return p.warmupImage(ctx, containerType, image)
 		})
+		if containerType == platform.FirecrackerContainerType {
+			eg.Go(func() error {
+				return p.warmupImage(ctx, containerType, strings.TrimPrefix(hostedrunner.RunnerContainerImage, platform.DockerPrefix))
+			})
+		}
 	}
 	if err := eg.Wait(); err != nil {
 		log.Warningf("Error warming up containers: %s", err)
 	}
 }
 
-// Get returns a runner that can be used to execute the given task. The caller
-// must call TryRecycle on the returned runner when done using it.
+// Get returns a runner bound to the the given task. The caller must call
+// TryRecycle on the returned runner when done using it.
 //
 // If the task has runner recycling enabled then it attempts to find a runner
 // from the pool that can execute the task. If runner recycling is disabled or
@@ -610,8 +672,8 @@ func (p *Pool) Get(ctx context.Context, task *repb.ExecutionTask) (*CommandRunne
 			"runner recycling is not supported for anonymous builds " +
 				`(recycling was requested via platform property "recycle-runner=true")`)
 	}
-	if props.RecycleRunner && props.EnableCASFS {
-		return nil, status.InvalidArgumentError("CASFS is not yet supported for recycled runners")
+	if props.RecycleRunner && props.EnableVFS {
+		return nil, status.InvalidArgumentError("VFS is not yet supported for recycled runners")
 	}
 
 	instanceName := task.GetExecuteRequest().GetInstanceName()
@@ -622,7 +684,11 @@ func (p *Pool) Get(ctx context.Context, task *repb.ExecutionTask) (*CommandRunne
 		workerKey = strings.Join(workerArgs, " ")
 	}
 
-	wsOpts := &workspace.Opts{Preserve: props.PreserveWorkspace, CleanInputs: props.CleanWorkspaceInputs}
+	wsOpts := &workspace.Opts{
+		Preserve:        props.PreserveWorkspace,
+		CleanInputs:     props.CleanWorkspaceInputs,
+		NonrootWritable: props.NonrootWorkspace,
+	}
 	if props.RecycleRunner {
 		r, err := p.take(ctx, &query{
 			User:             user,
@@ -637,22 +703,23 @@ func (p *Pool) Get(ctx context.Context, task *repb.ExecutionTask) (*CommandRunne
 		}
 		if r != nil {
 			log.Info("Reusing workspace for task.")
+			r.task = task
 			r.PlatformProperties = props
 			return r, nil
 		}
 	}
 	ws, err := workspace.New(p.env, p.buildRoot, wsOpts)
-	ctr, err := p.newContainer(ctx, props, task.GetCommand())
+	ctr, err := p.newContainer(ctx, props, task)
 	if err != nil {
 		return nil, err
 	}
-	var cfs *casfs.CASFS
+	var fs *vfs.VFS
 	var vfsServer *vfs_server.Server
-	enableCASFS := p.env.GetConfigurator().GetExecutorConfig().EnableCASFS && props.EnableCASFS
+	enableVFS := p.env.GetConfigurator().GetExecutorConfig().EnableVFS && props.EnableVFS
 	// Firecracker requires mounting the FS inside the guest VM so we can't just swap out the directory in the runner.
-	if enableCASFS && platform.ContainerType(props.WorkloadIsolationType) != platform.FirecrackerContainerType {
-		casfsDir := ws.Path() + "_casfs"
-		if err := os.Mkdir(casfsDir, 0755); err != nil {
+	if enableVFS && platform.ContainerType(props.WorkloadIsolationType) != platform.FirecrackerContainerType {
+		vfsDir := ws.Path() + "_vfs"
+		if err := os.Mkdir(vfsDir, 0755); err != nil {
 			return nil, status.UnavailableErrorf("could not create FUSE FS dir: %s", err)
 		}
 
@@ -671,35 +738,35 @@ func (p *Pool) Get(ctx context.Context, task *repb.ExecutionTask) (*CommandRunne
 		if err != nil {
 			return nil, err
 		}
-		fsProxyClient := vfspb.NewFileSystemClient(conn)
-		cfs = casfs.New(fsProxyClient, casfsDir, &casfs.Options{})
-		if err := cfs.Mount(); err != nil {
-			return nil, status.UnavailableErrorf("unable to mount CASFS at %q: %s", casfsDir, err)
+		vfsClient := vfspb.NewFileSystemClient(conn)
+		fs = vfs.New(vfsClient, vfsDir, &vfs.Options{})
+		if err := fs.Mount(); err != nil {
+			return nil, status.UnavailableErrorf("unable to mount VFS at %q: %s", vfsDir, err)
 		}
 	}
 	r := &CommandRunner{
 		env:                p.env,
 		imageCacheAuth:     p.imageCacheAuth,
 		ACL:                ACLForUser(user),
+		task:               task,
 		PlatformProperties: props,
 		InstanceName:       instanceName,
 		WorkerKey:          workerKey,
 		Container:          ctr,
 		Workspace:          ws,
-		CASFS:              cfs,
+		VFS:                fs,
 		VFSServer:          vfsServer,
 	}
 	p.runners = append(p.runners, r)
 	return r, nil
 }
 
-func (p *Pool) newContainer(ctx context.Context, props *platform.Properties, cmd *repb.Command) (*container.TracedCommandContainer, error) {
+func (p *Pool) newContainer(ctx context.Context, props *platform.Properties, task *repb.ExecutionTask) (*container.TracedCommandContainer, error) {
 	var ctr container.CommandContainer
 	switch platform.ContainerType(props.WorkloadIsolationType) {
 	case platform.DockerContainerType:
 		opts := p.dockerOptions()
 		opts.ForceRoot = props.DockerForceRoot
-		opts.EnableCASFS = props.EnableCASFS
 		ctr = docker.NewDockerContainer(
 			p.env, p.imageCacheAuth, p.dockerClient, props.ContainerImage,
 			p.hostBuildRoot(), opts,
@@ -707,12 +774,13 @@ func (p *Pool) newContainer(ctx context.Context, props *platform.Properties, cmd
 	case platform.ContainerdContainerType:
 		ctr = containerd.NewContainerdContainer(p.containerdSocket, props.ContainerImage, p.hostBuildRoot())
 	case platform.FirecrackerContainerType:
-		sizeEstimate := tasksize.Estimate(cmd)
+		sizeEstimate := tasksize.Estimate(task)
 		opts := firecracker.ContainerOpts{
 			ContainerImage:         props.ContainerImage,
 			ActionWorkingDirectory: p.hostBuildRoot(),
 			NumCPUs:                int64(math.Max(1.0, float64(sizeEstimate.GetEstimatedMilliCpu())/1000)),
 			MemSizeMB:              int64(math.Max(1.0, float64(sizeEstimate.GetEstimatedMemoryBytes())/1e6)),
+			DiskSlackSpaceMB:       int64(float64(sizeEstimate.GetEstimatedFreeDiskBytes()) / 1e6),
 			EnableNetworking:       true,
 			JailerRoot:             p.buildRoot,
 			AllowSnapshotStart:     false,
@@ -827,6 +895,16 @@ func (p *Pool) pausedRunnerCount() int {
 	return n
 }
 
+func (p *Pool) pausedRunnerMemoryUsageBytes() int64 {
+	b := int64(0)
+	for _, r := range p.runners {
+		if r.state == paused {
+			b += r.memoryUsageBytes
+		}
+	}
+	return b
+}
+
 // Shutdown removes all runners from the pool and prevents new ones from
 // being added.
 func (p *Pool) Shutdown(ctx context.Context) error {
@@ -933,7 +1011,10 @@ func (p *Pool) setLimits(cfg *config.RunnerPoolConfig) {
 
 	mem := cfg.MaxRunnerMemoryUsageBytes
 	if mem == 0 {
-		mem = int64(float64(totalRAMBytes) / float64(count))
+		mem = defaultRunnerMemoryLimitBytes
+		if mem > totalRAMBytes {
+			mem = totalRAMBytes
+		}
 	} else if mem < 0 {
 		// < 0 means no limit.
 		mem = math.MaxInt64
@@ -1006,23 +1087,31 @@ func (r *CommandRunner) sendPersistentWorkRequest(ctx context.Context, command *
 
 	workerArgs, flagFiles := SplitArgsIntoWorkerArgsAndFlagFiles(command.GetArguments())
 
+	execContext, cancel := context.WithCancel(ctx)
 	// If it's our first rodeo, create the persistent worker.
 	if r.stdinWriter == nil || r.stdoutReader == nil {
 		stdinReader, stdinWriter := io.Pipe()
 		stdoutReader, stdoutWriter := io.Pipe()
 		r.stdinWriter = stdinWriter
 		r.stdoutReader = bufio.NewReader(stdoutReader)
+		r.jsonDecoder = json.NewDecoder(r.stdoutReader)
 
 		command.Arguments = append(workerArgs, "--persistent_worker")
 
 		go func() {
-			res := r.Container.Exec(ctx, command, stdinReader, stdoutWriter)
+			res := r.Container.Exec(execContext, command, stdinReader, stdoutWriter)
 			stdinWriter.Close()
 			stdoutReader.Close()
 			log.Debugf("Persistent worker exited with response: %+v, flagFiles: %+v, workerArgs: %+v", res, flagFiles, workerArgs)
-			r.doNotReuse = true
 		}()
 	}
+
+	r.doNotReuse = true
+	defer func() {
+		if r.doNotReuse {
+			cancel()
+		}
+	}()
 
 	// We've got a worker - now let's build a work request.
 	requestProto := &wkpb.WorkRequest{
@@ -1051,42 +1140,71 @@ func (r *CommandRunner) sendPersistentWorkRequest(ctx context.Context, command *
 	}
 
 	// Encode the work requests
-	buf := proto.NewBuffer( /* buf */ nil)
-	if err := buf.EncodeMessage(requestProto); err != nil {
-		result.Error = status.WrapError(err, "request marshalling failed")
+	err = r.marshalWorkRequest(requestProto, r.stdinWriter)
+	if err != nil {
+		result.Error = status.WrapError(err, "marshaling work request")
 		return result
 	}
-
-	// Send it to our worker over stdin.
-	r.stdinWriter.Write(buf.Bytes())
 
 	// Now we've sent a work request, let's collect our response.
 	responseProto := &wkpb.WorkResponse{}
-
-	// Read the response size from stdout as a unsigned varint.
-	size, err := binary.ReadUvarint(r.stdoutReader)
+	err = r.unmarshalWorkResponse(responseProto, r.stdoutReader)
 	if err != nil {
-		result.Error = status.WrapError(err, "reading response length")
-		return result
-	}
-	data := make([]byte, size)
-
-	// Read the response proto from stdout.
-	if _, err := io.ReadFull(r.stdoutReader, data); err != nil {
-		result.Error = status.WrapError(err, "reading response proto")
-		return result
-	}
-
-	// Unmarshal the response proto.
-	if err := proto.Unmarshal(data, responseProto); err != nil {
-		result.Error = status.WrapError(err, "unmarshaling response proto")
+		result.Error = status.WrapError(err, "unmarshaling work response")
 		return result
 	}
 
 	// Populate the result from the response proto.
 	result.Stderr = []byte(responseProto.Output)
 	result.ExitCode = int(responseProto.ExitCode)
+	r.doNotReuse = false
 	return result
+}
+
+func (r *CommandRunner) marshalWorkRequest(requestProto *wkpb.WorkRequest, writer io.Writer) error {
+	protocol := r.PlatformProperties.PersistentWorkerProtocol
+	if protocol == workerProtocolJSONValue {
+		marshaler := jsonpb.Marshaler{EmitDefaults: true}
+		if err := marshaler.Marshal(writer, requestProto); err != nil {
+			return err
+		}
+		_, err := fmt.Fprintf(writer, "\n")
+		return err
+	}
+	if protocol != "" && protocol != workerProtocolProtobufValue {
+		return status.FailedPreconditionErrorf("unsupported persistent worker type %s", protocol)
+	}
+	buf := proto.NewBuffer( /* buf */ nil)
+	if err := buf.EncodeMessage(requestProto); err != nil {
+		return err
+	}
+	_, err := writer.Write(buf.Bytes())
+	return err
+}
+
+func (r *CommandRunner) unmarshalWorkResponse(responseProto *wkpb.WorkResponse, reader io.Reader) error {
+	protocol := r.PlatformProperties.PersistentWorkerProtocol
+	if protocol == workerProtocolJSONValue {
+		unmarshaller := jsonpb.Unmarshaler{AllowUnknownFields: true}
+		return unmarshaller.UnmarshalNext(r.jsonDecoder, responseProto)
+	}
+	if protocol != "" && protocol != workerProtocolProtobufValue {
+		return status.FailedPreconditionErrorf("unsupported persistent worker type %s", protocol)
+	}
+	// Read the response size from stdout as a unsigned varint.
+	size, err := binary.ReadUvarint(r.stdoutReader)
+	if err != nil {
+		return err
+	}
+	data := make([]byte, size)
+	// Read the response proto from stdout.
+	if _, err := io.ReadFull(r.stdoutReader, data); err != nil {
+		return err
+	}
+	if err := proto.Unmarshal(data, responseProto); err != nil {
+		return err
+	}
+	return nil
 }
 
 // Recursively expands arguments by replacing @filename args with the contents of the referenced

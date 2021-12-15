@@ -5,6 +5,7 @@ import (
 	"flag"
 	"fmt"
 	"io/fs"
+	"net/http"
 	"time"
 
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/api"
@@ -15,16 +16,20 @@ import (
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/backends/memcache"
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/backends/pubsub"
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/backends/redis_cache"
+	"github.com/buildbuddy-io/buildbuddy/enterprise/server/backends/redis_kvstore"
+	"github.com/buildbuddy-io/buildbuddy/enterprise/server/backends/redis_metrics_collector"
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/backends/s3_cache"
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/backends/userdb"
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/composable_cache"
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/execution_service"
+	"github.com/buildbuddy-io/buildbuddy/enterprise/server/hostedrunner"
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/invocation_search_service"
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/invocation_stat_service"
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/remote_execution/execution_server"
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/saml"
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/scheduling/scheduler_server"
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/scheduling/task_router"
+	"github.com/buildbuddy-io/buildbuddy/enterprise/server/selfauth"
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/splash"
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/usage"
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/usage_service"
@@ -38,6 +43,7 @@ import (
 	"github.com/buildbuddy-io/buildbuddy/server/real_environment"
 	"github.com/buildbuddy-io/buildbuddy/server/static"
 	"github.com/buildbuddy-io/buildbuddy/server/telemetry"
+	"github.com/buildbuddy-io/buildbuddy/server/util/fileresolver"
 	"github.com/buildbuddy-io/buildbuddy/server/util/grpc_client"
 	"github.com/buildbuddy-io/buildbuddy/server/util/healthcheck"
 	"github.com/buildbuddy-io/buildbuddy/server/util/log"
@@ -50,6 +56,7 @@ import (
 	telserver "github.com/buildbuddy-io/buildbuddy/enterprise/server/telemetry"
 	workflow "github.com/buildbuddy-io/buildbuddy/enterprise/server/workflow/service"
 	repb "github.com/buildbuddy-io/buildbuddy/proto/remote_execution"
+	httpfilters "github.com/buildbuddy-io/buildbuddy/server/http/filters"
 )
 
 var (
@@ -81,11 +88,12 @@ func configureFilesystemsOrDie(realEnv *real_environment.RealEnv) {
 			realEnv.SetAppFilesystem(appFS)
 		}
 	}
+	bundleFS, err := bundle.Get()
+	if err != nil {
+		log.Fatalf("Error getting bundle FS: %s", err)
+	}
+	realEnv.SetFileResolver(fileresolver.New(bundleFS, "enterprise"))
 	if realEnv.GetAppFilesystem() == nil {
-		bundleFS, err := bundle.Get()
-		if err != nil {
-			log.Fatalf("Error getting bundle FS: %s", err)
-		}
 		if realEnv.GetAppFilesystem() == nil {
 			appFS, err := fs.Sub(bundleFS, "app")
 			if err != nil {
@@ -105,8 +113,15 @@ func convertToProdOrDie(ctx context.Context, env *real_environment.RealEnv) {
 	env.SetAuthDB(authdb.NewAuthDB(env.GetDBHandle()))
 	configureFilesystemsOrDie(env)
 
+	authConfigs := env.GetConfigurator().GetAuthOauthProviders()
+	if env.GetConfigurator().GetSelfAuthEnabled() {
+		authConfigs = append(
+			authConfigs,
+			selfauth.Provider(env),
+		)
+	}
 	var authenticator interfaces.Authenticator
-	authenticator, err := auth.NewOpenIDAuthenticator(ctx, env)
+	authenticator, err := auth.NewOpenIDAuthenticator(ctx, env, authConfigs)
 	if err == nil {
 		if env.GetConfigurator().GetSAMLConfig().CertFile != "" {
 			log.Info("SAML auth configured.")
@@ -142,6 +157,12 @@ func convertToProdOrDie(ctx context.Context, env *real_environment.RealEnv) {
 		github.NewProvider(),
 		bitbucket.NewProvider(),
 	})
+
+	runnerService, err := hostedrunner.New(env)
+	if err != nil {
+		log.Fatalf("Error setting up runner: %s", err)
+	}
+	env.SetRunnerService(runnerService)
 
 	env.SetSplashPrinter(&splash.Printer{})
 }
@@ -191,11 +212,36 @@ func main() {
 	}
 
 	if redisTarget := configurator.GetDefaultRedisTarget(); redisTarget != "" {
-		redisClient := redisutil.NewClient(redisTarget, healthChecker, "default_redis")
-		realEnv.SetDefaultRedisClient(redisClient)
-		r := redis_cache.NewCache(realEnv.GetDefaultRedisClient(), 0)
-		realEnv.SetMetricsCollector(r)
-		realEnv.SetKeyValStore(r)
+		rdb := redisutil.NewClient(redisTarget, healthChecker, "default_redis")
+		realEnv.SetDefaultRedisClient(rdb)
+
+		rbuf := redisutil.NewCommandBuffer(rdb)
+		rbuf.StartPeriodicFlush(context.Background())
+		realEnv.GetHealthChecker().RegisterShutdownFunction(rbuf.StopPeriodicFlush)
+
+		rkv := redis_kvstore.New(rdb)
+		realEnv.SetKeyValStore(rkv)
+		rmc := redis_metrics_collector.New(rdb, rbuf)
+		realEnv.SetMetricsCollector(rmc)
+
+		if configurator.GetAppUsageTrackingEnabled() {
+			region := realEnv.GetConfigurator().GetAppRegion()
+			if region == "" {
+				log.Fatalf("Usage tracking requires app.region to be configured.")
+			}
+			opts := &usage.TrackerOpts{Region: region}
+			ut := usage.NewTracker(
+				realEnv, timeutil.NewClock(), usage.NewFlushLock(realEnv), rbuf, opts)
+			realEnv.SetUsageTracker(ut)
+
+			ut.StartDBFlush()
+			healthChecker.RegisterShutdownFunction(func(ctx context.Context) error {
+				ut.StopDBFlush()
+				return nil
+			})
+		}
+	} else if configurator.GetAppUsageTrackingEnabled() {
+		log.Fatalf("Usage tracking is enabled, but no Redis client is configured.")
 	}
 
 	if redisTarget := configurator.GetRemoteExecutionRedisTarget(); redisTarget != "" {
@@ -208,25 +254,6 @@ func main() {
 			log.Fatalf("Failed to create server: %s", err)
 		}
 		realEnv.SetTaskRouter(taskRouter)
-	}
-
-	if configurator.GetAppUsageTrackingEnabled() {
-		if realEnv.GetDefaultRedisClient() == nil {
-			log.Fatalf("Usage tracking is enabled, but no Redis client is configured.")
-		}
-		region := realEnv.GetConfigurator().GetAppRegion()
-		if region == "" {
-			log.Fatalf("Usage tracking requires app.region to be configured.")
-		}
-		opts := &usage.TrackerOpts{Region: region}
-		ut := usage.NewTracker(realEnv, timeutil.NewClock(), usage.NewFlushLock(realEnv), opts)
-		realEnv.SetUsageTracker(ut)
-
-		ut.StartDBFlush()
-		healthChecker.RegisterShutdownFunction(func(ctx context.Context) error {
-			ut.StopDBFlush()
-			return nil
-		})
 	}
 
 	if rbeConfig := configurator.GetRemoteExecutionConfig(); rbeConfig != nil {
@@ -319,5 +346,16 @@ func main() {
 	cleanupService.Start()
 	defer cleanupService.Stop()
 
-	libmain.StartAndRunServices(realEnv) // Does not return
+	if realEnv.GetConfigurator().GetSelfAuthEnabled() {
+		oauth, err := selfauth.NewSelfAuth(realEnv)
+		if err != nil {
+			log.Fatalf("Error initializing self auth: %s", err)
+		}
+		mux := realEnv.GetMux()
+		mux.Handle(oauth.AuthorizationEndpoint().Path, httpfilters.SetSecurityHeaders(http.HandlerFunc(oauth.Authorize)))
+		mux.Handle(oauth.TokenEndpoint().Path, httpfilters.SetSecurityHeaders(http.HandlerFunc(oauth.AccessToken)))
+		mux.Handle(oauth.JwksEndpoint().Path, httpfilters.SetSecurityHeaders(http.HandlerFunc(oauth.Jwks)))
+		mux.Handle("/.well-known/openid-configuration", httpfilters.SetSecurityHeaders(http.HandlerFunc(oauth.WellKnownOpenIDConfiguration)))
+	}
+	libmain.StartAndRunServices(realEnv) // Returns after graceful shutdown
 }

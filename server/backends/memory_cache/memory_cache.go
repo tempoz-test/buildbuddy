@@ -83,17 +83,19 @@ func (m *MemoryCache) Contains(ctx context.Context, d *repb.Digest) (bool, error
 	return contains, nil
 }
 
-func (m *MemoryCache) ContainsMulti(ctx context.Context, digests []*repb.Digest) (map[*repb.Digest]bool, error) {
-	foundMap := make(map[*repb.Digest]bool, len(digests))
+func (m *MemoryCache) FindMissing(ctx context.Context, digests []*repb.Digest) ([]*repb.Digest, error) {
+	var missing []*repb.Digest
 	// No parallelism here either. Not necessary for an in-memory cache.
 	for _, d := range digests {
 		ok, err := m.Contains(ctx, d)
 		if err != nil {
 			return nil, err
 		}
-		foundMap[d] = ok
+		if !ok {
+			missing = append(missing, d)
+		}
 	}
-	return foundMap, nil
+	return missing, nil
 }
 
 func (m *MemoryCache) Get(ctx context.Context, d *repb.Digest) ([]byte, error) {

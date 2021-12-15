@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"io/fs"
 	"io/ioutil"
 	"os"
 	"path/filepath"
@@ -15,7 +16,6 @@ import (
 	"github.com/buildbuddy-io/buildbuddy/server/interfaces"
 	"github.com/buildbuddy-io/buildbuddy/server/remote_cache/cachetools"
 	"github.com/buildbuddy-io/buildbuddy/server/remote_cache/digest"
-	"github.com/buildbuddy-io/buildbuddy/server/util/disk"
 	"github.com/buildbuddy-io/buildbuddy/server/util/fastcopy"
 	"github.com/buildbuddy-io/buildbuddy/server/util/status"
 	"github.com/golang/protobuf/proto"
@@ -33,12 +33,12 @@ type TransferInfo struct {
 	FileCount        int64
 	BytesTransferred int64
 	TransferDuration time.Duration
-	// Transfers tracks the digests of files that were transferred, keyed by their
+	// Transfers tracks the files that were transferred, keyed by their
 	// workspace-relative paths.
-	Transfers map[string]*repb.Digest
-	// Exists tracks the digests of files that already existed, keyed by their
+	Transfers map[string]*repb.FileNode
+	// Exists tracks the files that already existed, keyed by their
 	// workspace-relative paths.
-	Exists map[string]*repb.Digest
+	Exists map[string]*repb.FileNode
 }
 
 // DirHelper is a poor mans trie that helps us check if a partial path like
@@ -61,15 +61,19 @@ type DirHelper struct {
 	dirsToCreate []string
 
 	outputDirs []string
+
+	// dirPerms are the permissions used when creating output directories.
+	dirPerms fs.FileMode
 }
 
-func NewDirHelper(rootDir string, outputFiles, outputDirectories []string) *DirHelper {
+func NewDirHelper(rootDir string, outputFiles, outputDirectories []string, dirPerms fs.FileMode) *DirHelper {
 	c := &DirHelper{
 		rootDir:      rootDir,
 		prefixes:     make(map[string]struct{}, 0),
 		fullPaths:    make(map[string]struct{}, 0),
 		dirsToCreate: make([]string, 0),
 		outputDirs:   make([]string, 0),
+		dirPerms:     dirPerms,
 	}
 
 	for _, outputFile := range outputFiles {
@@ -103,7 +107,7 @@ func NewDirHelper(rootDir string, outputFiles, outputDirectories []string) *DirH
 
 func (c *DirHelper) CreateOutputDirs() error {
 	for _, dir := range c.dirsToCreate {
-		if err := disk.EnsureDirectoryExists(dir); err != nil {
+		if err := os.MkdirAll(dir, c.dirPerms); err != nil {
 			return err
 		}
 	}
@@ -262,7 +266,8 @@ func uploadFiles(ctx context.Context, env environment.Env, instanceName string, 
 	for _, uploadableFile := range filesToUpload {
 		// Add output files to the filecache.
 		if fc != nil && uploadableFile.dir == nil {
-			fc.AddFile(uploadableFile.ad.Digest, uploadableFile.fullFilePath)
+			node := uploadableFile.FileNode()
+			fc.AddFile(node, uploadableFile.fullFilePath)
 		}
 
 		rsc, err := uploadableFile.ReadSeekCloser()
@@ -452,7 +457,7 @@ func linkFileFromFileCache(d *repb.Digest, fp *FilePointer, fc interfaces.FileCa
 	if err := removeExisting(fp, opts); err != nil {
 		return false, err
 	}
-	return fc.FastLinkFile(d, fp.FullPath), nil
+	return fc.FastLinkFile(fp.FileNode, fp.FullPath), nil
 }
 
 // FileMap is a map of digests to file pointers containing the contents
@@ -506,7 +511,7 @@ func (ff *BatchFileFetcher) batchDownloadFiles(ctx context.Context, req *repb.Ba
 			return err
 		}
 		if ff.fileCache != nil {
-			ff.fileCache.AddFile(d, ptr.FullPath)
+			ff.fileCache.AddFile(ptr.FileNode, ptr.FullPath)
 		}
 		// Only need to write the first file explicitly; the rest of the files can
 		// be fast-copied from the first.
@@ -629,7 +634,7 @@ func (ff *BatchFileFetcher) bytestreamReadFiles(ctx context.Context, instanceNam
 		return err
 	}
 	if ff.fileCache != nil {
-		ff.fileCache.AddFile(fp.FileNode.Digest, fp.FullPath)
+		ff.fileCache.AddFile(fp.FileNode, fp.FullPath)
 	}
 
 	// The rest of the files in the list all have the same digest, so we can
@@ -711,10 +716,13 @@ func GetTreeFromRootDirectoryDigest(ctx context.Context, casClient repb.ContentA
 }
 
 type DownloadTreeOpts struct {
-	// Skip specifies file paths to skip, along with their digests. If the digest
-	// of a file to be downloaded doesn't match the digest of the file in this
-	// map, then it is re-downloaded (not skipped).
-	Skip map[string]*repb.Digest
+	// NonrootWritable specifies whether directories should be made writable
+	// by users other than root. Does not affect file permissions.
+	NonrootWritable bool
+	// Skip specifies file paths to skip, along with their file nodes. If the digest
+	// and executable bit of a file to be downloaded doesn't match the digest
+	// and executable bit of the file in this map, then it is re-downloaded (not skipped).
+	Skip map[string]*repb.FileNode
 	// TrackTransfers specifies whether to record the full set of files downloaded
 	// and return them in TransferInfo.Transfers.
 	TrackTransfers bool
@@ -733,17 +741,22 @@ func DownloadTree(ctx context.Context, env environment.Env, instanceName string,
 }
 
 func downloadTree(ctx context.Context, env environment.Env, instanceName string, rootDirectoryDigest *repb.Digest, rootDir string, dirMap map[digest.Key]*repb.Directory, startTime time.Time, txInfo *TransferInfo, opts *DownloadTreeOpts) (*TransferInfo, error) {
-	trackTransfersFn := func(relPath string, digest *repb.Digest) {}
-	trackExistsFn := func(relPath string, digest *repb.Digest) {}
+	trackTransfersFn := func(relPath string, node *repb.FileNode) {}
+	trackExistsFn := func(relPath string, node *repb.FileNode) {}
 	if opts.TrackTransfers {
-		txInfo.Transfers = map[string]*repb.Digest{}
-		txInfo.Exists = map[string]*repb.Digest{}
-		trackTransfersFn = func(relPath string, digest *repb.Digest) {
-			txInfo.Transfers[relPath] = digest
+		txInfo.Transfers = map[string]*repb.FileNode{}
+		txInfo.Exists = map[string]*repb.FileNode{}
+		trackTransfersFn = func(relPath string, node *repb.FileNode) {
+			txInfo.Transfers[relPath] = node
 		}
-		trackExistsFn = func(relPath string, digest *repb.Digest) {
-			txInfo.Exists[relPath] = digest
+		trackExistsFn = func(relPath string, node *repb.FileNode) {
+			txInfo.Exists[relPath] = node
 		}
+	}
+
+	dirPerms := fs.FileMode(0755)
+	if opts.NonrootWritable {
+		dirPerms = 0777
 	}
 
 	filesToFetch := make(map[digest.Key][]*FilePointer, 0)
@@ -754,11 +767,11 @@ func downloadTree(ctx context.Context, env environment.Env, instanceName string,
 				d := node.GetDigest()
 				fullPath := filepath.Join(location, node.Name)
 				relPath := trimPathPrefix(fullPath, rootDir)
-				skipDigest, ok := opts.Skip[relPath]
+				skippedNode, ok := opts.Skip[relPath]
 				if ok {
-					trackExistsFn(relPath, d)
+					trackExistsFn(relPath, node)
 				}
-				if ok && digestsEqual(skipDigest, d) {
+				if ok && nodesEqual(node, skippedNode) {
 					return
 				}
 				dk := digest.NewKey(d)
@@ -773,13 +786,16 @@ func downloadTree(ctx context.Context, env environment.Env, instanceName string,
 					RelativePath: relPath,
 				})
 				txInfo.FileCount += 1
-				trackTransfersFn(relPath, d)
+				trackTransfersFn(relPath, node)
 			}(fileNode, parentDir)
 		}
 		for _, child := range dir.GetDirectories() {
 			newRoot := filepath.Join(parentDir, child.GetName())
-			if err := disk.EnsureDirectoryExists(newRoot); err != nil {
+			if err := os.MkdirAll(newRoot, dirPerms); err != nil {
 				return err
+			}
+			if child.GetDigest().Hash == digest.EmptySha256 && child.GetDigest().SizeBytes == 0 {
+				continue
 			}
 			childDir, ok := dirMap[digest.NewKey(child.GetDigest())]
 			if !ok {
@@ -813,6 +829,8 @@ func downloadTree(ctx context.Context, env environment.Env, instanceName string,
 	return txInfo, nil
 }
 
-func digestsEqual(a *repb.Digest, b *repb.Digest) bool {
-	return a.GetHash() == b.GetHash() && a.GetSizeBytes() == b.GetSizeBytes()
+func nodesEqual(a *repb.FileNode, b *repb.FileNode) bool {
+	return a.GetDigest().GetHash() == b.GetDigest().GetHash() &&
+		a.GetDigest().GetSizeBytes() == b.GetDigest().GetSizeBytes() &&
+		a.GetIsExecutable() == b.GetIsExecutable()
 }

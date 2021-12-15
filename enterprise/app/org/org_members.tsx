@@ -1,6 +1,6 @@
 import React from "react";
 import { User } from "../../../app/auth/auth_service";
-import Button from "../../../app/components/button/button";
+import Button, { OutlinedButton } from "../../../app/components/button/button";
 import CheckboxButton from "../../../app/components/button/checkbox_button";
 import Checkbox from "../../../app/components/checkbox/checkbox";
 import alertService from "../../../app/alert/alert_service";
@@ -104,7 +104,13 @@ export default class OrgMembersComponent extends React.Component<OrgMembersProps
   // Edit role modal
 
   private onClickEditRole() {
-    this.setState({ isEditRoleModalVisible: true });
+    this.setState({
+      isEditRoleModalVisible: true,
+      // Set the initially selected role to match the current role of the
+      // first user. This is a sensible default when there's only one user
+      // selected.
+      roleToApply: this.getSelectedMembers()[0]?.role || DEFAULT_ROLE,
+    });
   }
   private onRequestCloseEditRoleModal() {
     if (this.state.isRoleUpdateLoading) return;
@@ -131,6 +137,13 @@ export default class OrgMembersComponent extends React.Component<OrgMembersProps
         })
       )
       .then(() => {
+        // After changing your own role within an org, refresh the page to
+        // trigger a user refresh and possibly a reroute, in case this settings
+        // page is no longer accessible.
+        if (this.state.selectedUserIds.has(this.props.user.displayUser.userId.id)) {
+          window.location.reload();
+          return;
+        }
         alertService.success("Changes applied successfully.");
         this.setState({
           isEditRoleModalVisible: false,
@@ -168,6 +181,12 @@ export default class OrgMembersComponent extends React.Component<OrgMembersProps
         })
       )
       .then(() => {
+        // After removing yourself from an org, refresh the page to trigger
+        // group reselection or login page as appropriate.
+        if (this.state.selectedUserIds.has(this.props.user.displayUser.userId.id)) {
+          window.location.reload();
+          return;
+        }
         alertService.success("Changes applied successfully.");
         this.setState({
           isRemoveModalVisible: false,
@@ -183,10 +202,12 @@ export default class OrgMembersComponent extends React.Component<OrgMembersProps
     return member.user.userId.id === this.props.user.displayUser.userId.id;
   }
 
+  private getSelectedMembers(): grp.GetGroupUsersResponse.IGroupUser[] {
+    return this.state.response.user.filter((member) => this.state.selectedUserIds.has(member.user.userId.id));
+  }
+
   private renderAffectedUsersList({ verb }: { verb: string }) {
-    const selectedMembers = this.state.response.user.filter((member) =>
-      this.state.selectedUserIds.has(member.user.userId.id)
-    );
+    const selectedMembers = this.getSelectedMembers();
     return (
       <>
         <div>
@@ -294,6 +315,11 @@ export default class OrgMembersComponent extends React.Component<OrgMembersProps
             <DialogFooter>
               <DialogFooterButtons>
                 {this.state.isRoleUpdateLoading && <Spinner />}
+                <OutlinedButton
+                  onClick={this.onRequestCloseEditRoleModal.bind(this)}
+                  disabled={this.state.isRoleUpdateLoading}>
+                  Cancel
+                </OutlinedButton>
                 <Button onClick={this.onClickApplyRoleEdits.bind(this)} disabled={this.state.isRoleUpdateLoading}>
                   Apply
                 </Button>
@@ -315,6 +341,11 @@ export default class OrgMembersComponent extends React.Component<OrgMembersProps
             <DialogFooter>
               <DialogFooterButtons>
                 {this.state.isRemoveLoading && <Spinner />}
+                <OutlinedButton
+                  onClick={this.onRequestCloseRemoveModal.bind(this)}
+                  disabled={this.state.isRemoveLoading}>
+                  Cancel
+                </OutlinedButton>
                 <Button
                   className="destructive"
                   onClick={this.onClickConfirmRemove.bind(this)}

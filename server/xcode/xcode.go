@@ -1,3 +1,4 @@
+//go:build !darwin
 // +build !darwin
 
 package xcode
@@ -5,8 +6,8 @@ package xcode
 type xcodeLocator struct {
 }
 
-func NewXcodeLocator() *xcodeLocator {
-	return &xcodeLocator{}
+func NewXcodeLocator() (*xcodeLocator, error) {
+	return &xcodeLocator{}, nil
 }
 
 func (x *xcodeLocator) DeveloperDirForVersion(version string) (string, error) {

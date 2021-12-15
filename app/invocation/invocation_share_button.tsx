@@ -1,3 +1,4 @@
+import { Share2 } from "lucide-react";
 import React from "react";
 import { acl } from "../../proto/acl_ts_proto";
 import { invocation } from "../../proto/invocation_ts_proto";
@@ -13,6 +14,7 @@ import Dialog, {
 } from "../components/dialog/dialog";
 import Input from "../components/input/input";
 import Modal from "../components/modal/modal";
+import Spinner from "../components/spinner/spinner";
 import Select, { Option } from "../components/select/select";
 import rpcService from "../service/rpc_service";
 import InvocationModel from "./invocation_model";
@@ -106,7 +108,7 @@ export default class InvocationShareButtonComponent extends React.Component<
       <>
         <FilledButton className="invocation-share-button" onClick={this.onShareButtonClick.bind(this)}>
           {/* TODO: Use an icon that signifies the current permissions */}
-          <img src="/image/share-2-white.svg" alt="" />
+          <Share2 className="icon white" />
           Share
         </FilledButton>
         <Modal isOpen={this.state.isOpen} onRequestClose={this.onRequestClose.bind(this)}>
@@ -154,7 +156,7 @@ export default class InvocationShareButtonComponent extends React.Component<
               <DialogFooterButtons>
                 {this.state.isLoading && (
                   <>
-                    <div className="loading" />
+                    <Spinner />
                     <span className="loading-message">Saving...</span>
                   </>
                 )}

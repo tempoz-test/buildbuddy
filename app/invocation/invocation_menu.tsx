@@ -1,8 +1,10 @@
+import { MoreVertical } from "lucide-react";
 import React from "react";
 import { invocation } from "../../proto/invocation_ts_proto";
 import { User } from "../auth/auth_service";
 import capabilities from "../capabilities/capabilities";
 import FilledButton, { OutlinedButton } from "../components/button/button";
+import Spinner from "../components/spinner/spinner";
 import Dialog, {
   DialogBody,
   DialogFooter,
@@ -81,8 +83,11 @@ export default class InvocationMenuComponent extends React.Component<InvocationM
     return (
       <>
         <div className="invocation-menu-container">
-          <OutlinedButton onClick={this.onClickMenuButton.bind(this)} className="invocation-menu-button">
-            <img src="/image/more-vertical.svg" alt="More invocation options" />
+          <OutlinedButton
+            onClick={this.onClickMenuButton.bind(this)}
+            className="invocation-menu-button"
+            title="More invocation options">
+            <MoreVertical />
           </OutlinedButton>
           <Popup isOpen={this.state.isMenuOpen} onRequestClose={this.onCloseMenu.bind(this)}>
             <Menu>
@@ -108,7 +113,7 @@ export default class InvocationMenuComponent extends React.Component<InvocationM
             </DialogBody>
             <DialogFooter>
               <DialogFooterButtons>
-                {this.state.isDeleteModalLoading && <div className="loading" />}
+                {this.state.isDeleteModalLoading && <Spinner />}
                 <OutlinedButton disabled={this.state.isDeleteModalLoading} onClick={this.onCloseDeleteModal.bind(this)}>
                   Cancel
                 </OutlinedButton>

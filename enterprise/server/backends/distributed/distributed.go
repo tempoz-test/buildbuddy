@@ -300,13 +300,14 @@ func (c *Cache) remoteContains(ctx context.Context, peer string, isolation *dcpb
 	}
 	return c.cacheProxy.RemoteContains(ctx, peer, isolation, d)
 }
-func (c *Cache) remoteContainsMulti(ctx context.Context, peer string, isolation *dcpb.Isolation, digests []*repb.Digest) (map[*repb.Digest]bool, error) {
+func (c *Cache) remoteFindMissing(ctx context.Context, peer string, isolation *dcpb.Isolation, digests []*repb.Digest) ([]*repb.Digest, error) {
 	if !c.config.DisableLocalLookup && peer == c.config.ListenAddr {
 		// No prefix necessary -- it's already set on the local cache.
-		return c.local.ContainsMulti(ctx, digests)
+		return c.local.FindMissing(ctx, digests)
 	}
-	return c.cacheProxy.RemoteContainsMulti(ctx, peer, isolation, digests)
+	return c.cacheProxy.RemoteFindMissing(ctx, peer, isolation, digests)
 }
+
 func (c *Cache) remoteGetMulti(ctx context.Context, peer string, isolation *dcpb.Isolation, digests []*repb.Digest) (map[*repb.Digest][]byte, error) {
 	if !c.config.DisableLocalLookup && peer == c.config.ListenAddr {
 		// No prefix necessary -- it's already set on the local cache.
@@ -459,10 +460,10 @@ func (c *Cache) Contains(ctx context.Context, d *repb.Digest) (bool, error) {
 	return false, nil
 }
 
-func (c *Cache) ContainsMulti(ctx context.Context, digests []*repb.Digest) (map[*repb.Digest]bool, error) {
+func (c *Cache) FindMissing(ctx context.Context, digests []*repb.Digest) ([]*repb.Digest, error) {
 	mu := sync.RWMutex{} // protects(foundMap)
 	hashDigests := make(map[string][]*repb.Digest, 0)
-	foundMap := make(map[string]bool, len(digests))
+	foundMap := make(map[string]struct{}, len(digests))
 	peerMap := make(map[string]*peerset.PeerSet, len(digests))
 	for _, d := range digests {
 		hash := d.GetHash()
@@ -499,7 +500,7 @@ func (c *Cache) ContainsMulti(ctx context.Context, digests []*repb.Digest) (map[
 					stillMissing = append(stillMissing, h)
 				}
 			}
-			c.log.Debugf("ContainsMulti: digests not found: %+v", stillMissing)
+			c.log.Debugf("FindMissing: digests not found: %+v", stillMissing)
 			// If we aren't able to plan any more batch requests, that means
 			// we're out of peers and should exit, returning what we have.
 			break
@@ -509,7 +510,11 @@ func (c *Cache) ContainsMulti(ctx context.Context, digests []*repb.Digest) (map[
 			peer := peer
 			digests := digests
 			eg.Go(func() error {
-				peerRsp, err := c.remoteContainsMulti(gCtx, peer, c.isolation, digests)
+				peerRsp, err := c.remoteFindMissing(gCtx, peer, c.isolation, digests)
+				peerMissingHashes := make(map[string]struct{})
+				for _, d := range peerRsp {
+					peerMissingHashes[d.GetHash()] = struct{}{}
+				}
 				mu.Lock()
 				defer mu.Unlock()
 				if err != nil {
@@ -518,9 +523,9 @@ func (c *Cache) ContainsMulti(ctx context.Context, digests []*repb.Digest) (map[
 					}
 					return nil
 				}
-				for d, exists := range peerRsp {
-					if exists {
-						foundMap[d.GetHash()] = exists
+				for _, d := range digests {
+					if _, ok := peerMissingHashes[d.GetHash()]; !ok {
+						foundMap[d.GetHash()] = struct{}{}
 					}
 				}
 				return nil
@@ -543,22 +548,22 @@ func (c *Cache) ContainsMulti(ctx context.Context, digests []*repb.Digest) (map[
 	// For every digest we found, if we did not find it
 	// on the first peer in our list, we want to backfill it.
 	backfills := make([]*backfillOrder, 0)
-	for h, exists := range foundMap {
-		if exists {
-			d := hashDigests[h][0]
-			ps := peerMap[h]
-			backfills = append(backfills, c.getBackfillOrders(d, ps)...)
-		}
+	for h := range foundMap {
+		d := hashDigests[h][0]
+		ps := peerMap[h]
+		backfills = append(backfills, c.getBackfillOrders(d, ps)...)
 	}
 	if err := c.backfillPeers(ctx, backfills); err != nil {
 		c.log.Debugf("Error backfilling peers: %s", err)
 	}
 
-	rsp := make(map[*repb.Digest]bool, len(digests))
+	var missing []*repb.Digest
 	for _, d := range digests {
-		rsp[d] = foundMap[d.GetHash()]
+		if _, ok := foundMap[d.GetHash()]; !ok {
+			missing = append(missing, d)
+		}
 	}
-	return rsp, nil
+	return missing, nil
 }
 
 // The first reader with a non-empty value will be returned. If all potential

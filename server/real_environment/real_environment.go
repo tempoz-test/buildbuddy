@@ -2,6 +2,7 @@ package real_environment
 
 import (
 	"io/fs"
+	"net/url"
 	"time"
 
 	"github.com/go-redis/redis/v8"
@@ -38,6 +39,7 @@ type RealEnv struct {
 	taskRouter                       interfaces.TaskRouter
 	healthChecker                    interfaces.HealthChecker
 	workflowService                  interfaces.WorkflowService
+	runnerService                    interfaces.RunnerService
 	gitProviders                     interfaces.GitProviders
 	staticFilesystem                 fs.FS
 	appFilesystem                    fs.FS
@@ -75,6 +77,8 @@ type RealEnv struct {
 	buildEventProxyClients           []pepb.PublishBuildEventClient
 	webhooks                         []interfaces.Webhook
 	xcodeLocator                     interfaces.XcodeLocator
+	fileResolver                     fs.FS
+	mux                              interfaces.HttpServeMux
 }
 
 func NewRealEnv(c *config.Configurator, h interfaces.HealthChecker) *RealEnv {
@@ -310,6 +314,12 @@ func (r *RealEnv) GetWorkflowService() interfaces.WorkflowService {
 func (r *RealEnv) SetWorkflowService(wf interfaces.WorkflowService) {
 	r.workflowService = wf
 }
+func (r *RealEnv) GetRunnerService() interfaces.RunnerService {
+	return r.runnerService
+}
+func (r *RealEnv) SetRunnerService(wf interfaces.RunnerService) {
+	r.runnerService = wf
+}
 func (r *RealEnv) GetGitProviders() interfaces.GitProviders {
 	return r.gitProviders
 }
@@ -353,4 +363,31 @@ func (r *RealEnv) SetRemoteExecutionRedisPubSubClient(client *redis.Client) {
 
 func (r *RealEnv) GetRemoteExecutionRedisPubSubClient() *redis.Client {
 	return r.remoteExecutionRedisPubSubClient
+}
+
+func (r *RealEnv) GetFileResolver() fs.FS {
+	return r.fileResolver
+}
+
+func (r *RealEnv) SetFileResolver(fr fs.FS) {
+	r.fileResolver = fr
+}
+
+func (r *RealEnv) GetSelfAuthURL() *url.URL {
+	u, err := url.Parse(r.GetConfigurator().GetAppBuildBuddyURL())
+	if err != nil {
+		u = &url.URL{
+			Scheme: "http",
+			Host:   "localhost",
+		}
+	}
+	return u
+}
+
+func (r *RealEnv) GetMux() interfaces.HttpServeMux {
+	return r.mux
+}
+
+func (r *RealEnv) SetMux(mux interfaces.HttpServeMux) {
+	r.mux = mux
 }

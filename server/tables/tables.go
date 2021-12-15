@@ -3,12 +3,10 @@ package tables
 import (
 	"fmt"
 	"strings"
-	"time"
 
 	"github.com/buildbuddy-io/buildbuddy/server/util/log"
 	"github.com/buildbuddy-io/buildbuddy/server/util/random"
 	"github.com/buildbuddy-io/buildbuddy/server/util/role"
-	"github.com/buildbuddy-io/buildbuddy/server/util/timeutil"
 	"gorm.io/gorm"
 
 	grpb "github.com/buildbuddy-io/buildbuddy/proto/group"
@@ -75,14 +73,14 @@ type Model struct {
 // Timestamps are hard and differing sql implementations do... a lot. Too much.
 // So, we handle this in go-code and set as the timestamp in microseconds.
 func (m *Model) BeforeCreate(tx *gorm.DB) (err error) {
-	nowUsec := timeutil.ToUsec(time.Now())
+	nowUsec := tx.Config.NowFunc().UnixMicro()
 	m.CreatedAtUsec = nowUsec
 	m.UpdatedAtUsec = nowUsec
 	return nil
 }
 
 func (m *Model) BeforeUpdate(tx *gorm.DB) (err error) {
-	m.UpdatedAtUsec = timeutil.ToUsec(time.Now())
+	m.UpdatedAtUsec = tx.Config.NowFunc().UnixMicro()
 	return nil
 }
 
@@ -167,17 +165,19 @@ type Group struct {
 	WriteToken string `gorm:"index:write_token_index"`
 
 	// The group's Github API token.
-	GithubToken string
+	GithubToken *string
 	Model
 
 	SharingEnabled bool `gorm:"default:true"`
 
 	// If enabled, builds for this group will always use their own executors instead of the installation-wide shared
 	// executors.
-	UseGroupOwnedExecutors bool
+	UseGroupOwnedExecutors *bool
 
 	// The SAML IDP Metadata URL for this group.
-	SamlIdpMetadataUrl string
+	SamlIdpMetadataUrl *string
+
+	InvocationWebhookURL string `gorm:"not null;default:''"`
 }
 
 func (g *Group) TableName() string {
@@ -201,6 +201,11 @@ func (ug *UserGroup) TableName() string {
 	return "UserGroups"
 }
 
+type GroupRole struct {
+	Group Group
+	Role  uint32
+}
+
 type User struct {
 	// The buildbuddy user ID.
 	UserID string `gorm:"primaryKey;"`
@@ -215,9 +220,12 @@ type User struct {
 	Email     string
 	ImageURL  string
 
-	// Groups are used to determine read/write permissions
+	// User-specific Github token (if linked).
+	GithubToken string
+
+	// Group roles are used to determine read/write permissions
 	// for everything.
-	Groups []*Group `gorm:"-"`
+	Groups []*GroupRole `gorm:"-"`
 	Model
 }
 
@@ -346,23 +354,6 @@ func (t *TelemetryLog) TableName() string {
 	return "TelemetryLog"
 }
 
-type ExecutionTask struct {
-	TaskID         string `gorm:"primaryKey"`
-	Arch           string
-	Pool           string
-	OS             string
-	SerializedTask []byte `gorm:"size:max"`
-	Model
-	EstimatedMilliCPU    int64
-	ClaimedAtUsec        int64
-	AttemptCount         int64
-	EstimatedMemoryBytes int64
-}
-
-func (n *ExecutionTask) TableName() string {
-	return "ExecutionTasks"
-}
-
 type CacheLog struct {
 	InvocationID       string `gorm:"primaryKey"`
 	JoinKey            string `gorm:"primaryKey"`
@@ -421,6 +412,10 @@ type Workflow struct {
 	WebhookID   string `gorm:"uniqueIndex:workflow_webhook_id_index"`
 	Model
 	Perms int `gorm:"index:workflow_perms"`
+	// InstanceNameSuffix is appended to the remote instance name for CI runner
+	// actions associated with this workflow. It can be updated in order to
+	// prevent reusing a bad workspace.
+	InstanceNameSuffix string `gorm:"not null;default:''"`
 	// GitProviderWebhookID is the ID returned from the Git provider API when
 	// registering the webhook. This will only be set for the case where we
 	// successfully auto-registered the webhook.
@@ -524,7 +519,7 @@ func PreAutoMigrate(db *gorm.DB) ([]PostAutoMigrateLogic, error) {
 		}
 		// Before creating a unique index, need to replace empty strings with NULL.
 		if !m.HasIndex("Groups", "url_identifier_unique_index") {
-			if err := db.Exec(`UPDATE Groups SET url_identifier = NULL WHERE url_identifier = ""`).Error; err != nil {
+			if err := db.Exec(`UPDATE ` + "`Groups`" + ` SET url_identifier = NULL WHERE url_identifier = ""`).Error; err != nil {
 				return nil, err
 			}
 		}
@@ -625,7 +620,6 @@ func init() {
 	registerTable("TO", &Token{})
 	registerTable("EX", &Execution{})
 	registerTable("TL", &TelemetryLog{})
-	registerTable("ET", &ExecutionTask{})
 	registerTable("CL", &CacheLog{})
 	registerTable("TA", &Target{})
 	registerTable("TS", &TargetStatus{})

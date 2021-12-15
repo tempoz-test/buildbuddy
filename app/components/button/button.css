@@ -55,6 +55,8 @@
   background: transparent;
   border: 1px solid rgba(20, 20, 20, 0.1);
   transition: 200ms ease;
+  flex-shrink: 1;
+  overflow: hidden;
 }
 
 .outlined-button:focus {
@@ -79,6 +81,11 @@
   cursor: not-allowed;
 }
 
+.outlined-button span {
+  text-overflow: ellipsis;
+  overflow: hidden;
+}
+
 .base-button.checkbox-button {
   padding: 0;
 }
@@ -98,4 +105,35 @@
 
 .checkbox-button label > :not(:last-child) {
   margin-right: 8px;
+}
+
+.outlined-button-group {
+  background: transparent;
+  display: flex;
+  border-radius: 8px;
+  box-sizing: border-box;
+  border: 1px solid rgba(20, 20, 20, 0.1);
+}
+
+.outlined-button-group > .outlined-button {
+  border: none;
+  min-height: 38px; /* = 40px usual min-height - 1px for top + bottom border from parent */
+}
+
+.outlined-button-group > .outlined-button:not(:last-child) {
+  border-top-right-radius: 0;
+  border-bottom-right-radius: 0;
+  border-right: 1px solid rgba(20, 20, 20, 0.1);
+}
+
+.outlined-button-group > .outlined-button:not(:first-child) {
+  border-top-left-radius: 0;
+  border-bottom-left-radius: 0;
+}
+
+.icon-button {
+  padding: 0;
+  width: 40px;
+  justify-content: center;
+  flex-shrink: 0;
 }

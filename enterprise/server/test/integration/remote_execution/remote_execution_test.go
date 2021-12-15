@@ -1,14 +1,19 @@
 package remote_execution_test
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/scheduling/scheduler_server"
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/test/integration/remote_execution/rbetest"
+	"github.com/buildbuddy-io/buildbuddy/server/interfaces"
+	"github.com/buildbuddy-io/buildbuddy/server/testutil/testenv"
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testfs"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -226,6 +231,44 @@ func TestSimpleCommand_RunnerReuse_MultipleExecutors_RoutesCommandToSameExecutor
 	require.Equal(t, 0, res.ExitCode)
 }
 
+func TestSimpleCommand_RunnerReuse_PoolSelectionViaHeader_RoutesCommandToSameExecutor(t *testing.T) {
+	rbe := rbetest.NewRBETestEnv(t)
+
+	rbe.AddBuildBuddyServers(3)
+	for i := 0; i < 5; i++ {
+		rbe.AddExecutorWithOptions(&rbetest.ExecutorOptions{Pool: "foo"})
+	}
+
+	platform := &repb.Platform{
+		Properties: []*repb.Platform_Property{
+			{Name: "recycle-runner", Value: "true"},
+			{Name: "preserve-workspace", Value: "true"},
+			{Name: "Pool", Value: "THIS_VALUE_SHOULD_BE_OVERRIDDEN"},
+		},
+	}
+	opts := &rbetest.ExecuteOpts{
+		UserID: rbe.UserID1,
+		RemoteHeaders: map[string]string{
+			"x-buildbuddy-platform.pool": "foo",
+		},
+	}
+	cmd := rbe.Execute(&repb.Command{
+		Arguments: []string{"touch", "foo.txt"},
+		Platform:  platform,
+	}, opts)
+	res := cmd.Wait()
+
+	require.Equal(t, 0, res.ExitCode)
+
+	cmd = rbe.Execute(&repb.Command{
+		Arguments: []string{"stat", "foo.txt"},
+		Platform:  platform,
+	}, opts)
+	res = cmd.Wait()
+
+	require.Equal(t, 0, res.ExitCode)
+}
+
 func TestSimpleCommandWithMultipleExecutors(t *testing.T) {
 	rbe := rbetest.NewRBETestEnv(t)
 
@@ -238,6 +281,186 @@ func TestSimpleCommandWithMultipleExecutors(t *testing.T) {
 	assert.Equal(t, 0, res.ExitCode, "exit code should be propagated")
 	assert.Equal(t, "hello\n", res.Stdout, "stdout should be propagated")
 	assert.Equal(t, "bye\n", res.Stderr, "stderr should be propagated")
+}
+
+func TestSimpleCommandWithPoolSelectionViaPlatformProp_Success(t *testing.T) {
+	rbe := rbetest.NewRBETestEnv(t)
+
+	rbe.AddBuildBuddyServer()
+	rbe.AddExecutorWithOptions(&rbetest.ExecutorOptions{Pool: "foo"})
+
+	platform := &repb.Platform{
+		Properties: []*repb.Platform_Property{
+			{Name: "Pool", Value: "foo"},
+		},
+	}
+	opts := &rbetest.ExecuteOpts{}
+
+	cmd := rbe.Execute(&repb.Command{
+		Arguments: []string{
+			"touch", "output.txt", "undeclared_output.txt", "output_dir/output.txt",
+		},
+		Platform:          platform,
+		OutputDirectories: []string{"output_dir"},
+		OutputFiles:       []string{"output.txt"},
+	}, opts)
+	res := cmd.Wait()
+
+	require.Equal(t, 0, res.ExitCode)
+}
+
+func TestSimpleCommandWithPoolSelectionViaPlatformProp_Failure(t *testing.T) {
+	rbe := rbetest.NewRBETestEnv(t)
+
+	rbe.AddBuildBuddyServer()
+	rbe.AddExecutorWithOptions(&rbetest.ExecutorOptions{Pool: "bar"})
+
+	platform := &repb.Platform{
+		Properties: []*repb.Platform_Property{
+			{Name: "Pool", Value: "foo"},
+		},
+	}
+	opts := &rbetest.ExecuteOpts{}
+
+	cmd := rbe.Execute(&repb.Command{
+		Arguments: []string{
+			"touch", "output.txt", "undeclared_output.txt", "output_dir/output.txt",
+		},
+		Platform:          platform,
+		OutputDirectories: []string{"output_dir"},
+		OutputFiles:       []string{"output.txt"},
+	}, opts)
+	err := cmd.MustFail()
+
+	require.Contains(t, err.Error(), `No registered executors in pool "foo"`)
+}
+
+func TestSimpleCommandWithPoolSelectionViaHeader(t *testing.T) {
+	rbe := rbetest.NewRBETestEnv(t)
+
+	rbe.AddBuildBuddyServer()
+	rbe.AddExecutorWithOptions(&rbetest.ExecutorOptions{Pool: "foo"})
+	platform := &repb.Platform{
+		Properties: []*repb.Platform_Property{
+			{Name: "Pool", Value: "THIS_VALUE_SHOULD_BE_OVERRIDDEN"},
+		},
+	}
+	opts := &rbetest.ExecuteOpts{
+		RemoteHeaders: map[string]string{
+			"x-buildbuddy-platform.pool": "foo",
+		},
+	}
+
+	cmd := rbe.Execute(&repb.Command{
+		Arguments: []string{
+			"touch", "output.txt", "undeclared_output.txt", "output_dir/output.txt",
+		},
+		Platform:          platform,
+		OutputDirectories: []string{"output_dir"},
+		OutputFiles:       []string{"output.txt"},
+	}, opts)
+	res := cmd.Wait()
+
+	require.Equal(t, 0, res.ExitCode)
+}
+
+func TestSimpleCommandWithOSArchPool_CaseInsensitive(t *testing.T) {
+	rbe := rbetest.NewRBETestEnv(t)
+
+	rbe.AddBuildBuddyServer()
+	rbe.AddExecutorWithOptions(&rbetest.ExecutorOptions{Pool: "foo"})
+	platform := &repb.Platform{
+		Properties: []*repb.Platform_Property{
+			{Name: "Pool", Value: "FoO"},
+			{Name: "OSFamily", Value: "LiNuX"},
+			{Name: "Arch", Value: "AmD64"},
+		},
+	}
+
+	cmd := rbe.Execute(&repb.Command{
+		Arguments: []string{"pwd"},
+		Platform:  platform,
+	}, &rbetest.ExecuteOpts{})
+	res := cmd.Wait()
+
+	require.Equal(t, 0, res.ExitCode)
+}
+
+func TestSimpleCommand_DefaultWorkspacePermissions(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skipf("Test requires GNU stat")
+	}
+
+	rbe := rbetest.NewRBETestEnv(t)
+	rbe.AddBuildBuddyServer()
+	rbe.AddExecutor()
+
+	inputRoot := testfs.MakeTempDir(t)
+	testfs.WriteAllFileContents(t, inputRoot, map[string]string{
+		"input_dir/input.txt": "",
+	})
+
+	dirs := []string{
+		".", "output_dir", "output_dir_parent", "output_dir_parent/output_dir_child",
+		"output_file_parent", "input_dir",
+	}
+
+	cmd := rbe.Execute(&repb.Command{
+		// %a %n prints perms in octal followed by the file name.
+		Arguments:         append([]string{"stat", "--format", "%a %n"}, dirs...),
+		OutputDirectories: []string{"output_dir", "output_dir_parent/output_dir_child"},
+		OutputFiles:       []string{"output_file_parent/output.txt"},
+	}, &rbetest.ExecuteOpts{InputRootDir: inputRoot})
+	res := cmd.Wait()
+
+	expectedOutput := ""
+	for _, dir := range dirs {
+		expectedOutput += "755 " + dir + "\n"
+	}
+
+	require.Equal(t, expectedOutput, res.Stdout)
+}
+
+func TestSimpleCommand_NonrootWorkspacePermissions(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skipf("Test requires GNU stat")
+	}
+
+	rbe := rbetest.NewRBETestEnv(t)
+	rbe.AddBuildBuddyServer()
+	rbe.AddExecutor()
+
+	platform := &repb.Platform{
+		Properties: []*repb.Platform_Property{
+			{Name: "nonroot-workspace", Value: "true"},
+		},
+	}
+
+	inputRoot := testfs.MakeTempDir(t)
+	testfs.WriteAllFileContents(t, inputRoot, map[string]string{
+		"input_dir/input.txt": "",
+	})
+
+	dirs := []string{
+		".", "output_dir", "output_dir_parent", "output_dir_parent/output_dir_child",
+		"output_file_parent", "input_dir",
+	}
+
+	cmd := rbe.Execute(&repb.Command{
+		// %a %n prints perms in octal followed by the file name.
+		Arguments:         append([]string{"stat", "--format", "%a %n"}, dirs...),
+		OutputDirectories: []string{"output_dir", "output_dir_parent/output_dir_child"},
+		OutputFiles:       []string{"output_file_parent/output.txt"},
+		Platform:          platform,
+	}, &rbetest.ExecuteOpts{InputRootDir: inputRoot})
+	res := cmd.Wait()
+
+	expectedOutput := ""
+	for _, dir := range dirs {
+		expectedOutput += "777 " + dir + "\n"
+	}
+
+	require.Equal(t, expectedOutput, res.Stdout)
 }
 
 func TestManySimpleCommandsWithMultipleExecutors(t *testing.T) {
@@ -533,4 +756,104 @@ func TestWaitExecution(t *testing.T) {
 		res := cmd.Wait()
 		assert.Equal(t, i, res.ExitCode, "exit code should be propagated for command %q", cmd.Name)
 	}
+}
+
+type fixedNodeTaskRouter struct {
+	mu          sync.Mutex
+	executorIDs map[string]struct{}
+}
+
+func newFixedNodeTaskRouter(executorIDs []string) *fixedNodeTaskRouter {
+	idSet := make(map[string]struct{})
+	for _, id := range executorIDs {
+		idSet[id] = struct{}{}
+	}
+	return &fixedNodeTaskRouter{executorIDs: idSet}
+}
+
+func (f *fixedNodeTaskRouter) RankNodes(ctx context.Context, cmd *repb.Command, remoteInstanceName string, nodes []interfaces.ExecutionNode) []interfaces.ExecutionNode {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var out []interfaces.ExecutionNode
+	for _, n := range nodes {
+		if _, ok := f.executorIDs[n.GetExecutorID()]; ok {
+			out = append(out, n)
+		}
+	}
+	return out
+}
+
+func (f *fixedNodeTaskRouter) MarkComplete(ctx context.Context, cmd *repb.Command, remoteInstanceName, executorInstanceID string) {
+}
+
+func (f *fixedNodeTaskRouter) UpdateSubset(executorIDs []string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	idSet := make(map[string]struct{})
+	for _, id := range executorIDs {
+		idSet[id] = struct{}{}
+	}
+	f.executorIDs = idSet
+}
+
+func TestTaskReservationsNotLostOnExecutorShutdown(t *testing.T) {
+	rbe := rbetest.NewRBETestEnv(t)
+
+	var busyExecutorIDs []string
+	for i := 1; i <= 3; i++ {
+		busyExecutorIDs = append(busyExecutorIDs, fmt.Sprintf("busyExecutor%d", i))
+	}
+
+	// Set up the task router to send all reservations to "busy" executors. These executors will queue up tasks but not
+	// try to execute any of them.
+	taskRouter := newFixedNodeTaskRouter(busyExecutorIDs)
+	rbe.AddBuildBuddyServerWithOptions(&rbetest.BuildBuddyServerOptions{EnvModifier: func(env *testenv.TestEnv) {
+		env.SetTaskRouter(taskRouter)
+	}})
+
+	var busyExecutors []*rbetest.Executor
+	for _, id := range busyExecutorIDs {
+		e := rbe.AddSingleTaskExecutorWithOptions(&rbetest.ExecutorOptions{Name: id})
+		e.ShutdownTaskScheduler()
+		busyExecutors = append(busyExecutors, e)
+	}
+	// Add another executor that should execute all scheduled commands once the "busy" executors are shut down.
+	_ = rbe.AddExecutorWithOptions(&rbetest.ExecutorOptions{Name: "newExecutor"})
+
+	// Now schedule some commands. The fake task router will ensure that the reservations only land on "busy"
+	// executors.
+	var cmds []*rbetest.Command
+	for i := 0; i < 10; i++ {
+		cmd := rbe.ExecuteCustomCommand("sh", "-c", fmt.Sprintf("echo 'hello from command %d'", i))
+		cmds = append(cmds, cmd)
+	}
+	for _, cmd := range cmds {
+		cmd.WaitAccepted()
+	}
+
+	// Update the task router to allow tasks to be routed to the non-busy executor.
+	taskRouter.UpdateSubset(append(busyExecutorIDs, "newExecutor"))
+
+	// Now shutdown the "busy" executors which should still have all the commands in their queues.
+	// During shutdown the tasks should get re-enqueued onto the non-busy executor.
+	for _, e := range busyExecutors {
+		rbe.RemoveExecutor(e)
+	}
+
+	for _, cmd := range cmds {
+		res := cmd.Wait()
+		assert.Equal(t, "newExecutor", res.Executor, "[%s] should have been executed on new executor", cmd.Name)
+	}
+}
+
+func TestCommandWithMissingInputRootDigest(t *testing.T) {
+	rbe := rbetest.NewRBETestEnv(t)
+
+	rbe.AddBuildBuddyServer()
+	rbe.AddExecutor()
+
+	cmd := rbe.Execute(&repb.Command{Arguments: []string{"echo"}}, &rbetest.ExecuteOpts{SimulateMissingDigest: true})
+	err := cmd.MustFail()
+	require.Contains(t, err.Error(), "already attempted")
+	require.Contains(t, err.Error(), "not found in cache")
 }

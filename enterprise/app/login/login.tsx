@@ -14,7 +14,13 @@ interface State {
   defaultToSSO: boolean;
 }
 
-export default class LoginComponent extends React.Component<{}, State> {
+interface Props {
+  search: URLSearchParams;
+}
+
+export default class LoginComponent extends React.Component<Props, State> {
+  props: Props;
+
   state: State = {
     showSSO: false,
     defaultToSSO: false,
@@ -98,20 +104,24 @@ export default class LoginComponent extends React.Component<{}, State> {
       );
     }
 
+    let redirecting = this.props.search.has("redirect_url");
     return (
       <div className="login">
         <div className="container">
           <div className="login-box">
             <div className={`login-hero ${!this.isJoiningOrg() ? "hide-on-mobile" : ""}`}>
               <div className="login-hero-title">
-                {!this.isJoiningOrg() && (
+                {!redirecting && !this.isJoiningOrg() && (
                   <>
                     Faster Builds.
                     <br />
                     Happier Developers.
                   </>
                 )}
-                {this.isJoiningOrg() && this.state.orgName && <>Join {this.state.orgName} on BuildBuddy</>}
+                {!redirecting && this.isJoiningOrg() && this.state.orgName && (
+                  <>Join {this.state.orgName} on BuildBuddy</>
+                )}
+                {redirecting && <>Login to continue</>}
               </div>
               <div className="hide-on-mobile">
                 BuildBuddy provides enterprise features for Bazel — the open source build system that allows you to
@@ -119,8 +129,12 @@ export default class LoginComponent extends React.Component<{}, State> {
               </div>
             </div>
             <div className="login-buttons">
-              <button onClick={this.handleLoginClicked.bind(this)}>Sign up for BuildBuddy</button>
-              <button onClick={this.handleLoginClicked.bind(this)}>Log in to BuildBuddy</button>
+              <button className="signup-button" onClick={this.handleLoginClicked.bind(this)}>
+                Sign up for BuildBuddy
+              </button>
+              <button className="login-button" onClick={this.handleLoginClicked.bind(this)}>
+                Log in to BuildBuddy
+              </button>
               {capabilities.anonymous && (
                 <button onClick={this.handleSetupClicked.bind(this)}>Use BuildBuddy without an account</button>
               )}

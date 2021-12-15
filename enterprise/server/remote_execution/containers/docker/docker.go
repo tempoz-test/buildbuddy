@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
+	"os"
 	"os/exec"
 	"os/user"
 	"path/filepath"
@@ -44,7 +45,6 @@ type DockerOptions struct {
 	ForceRoot               bool
 	DockerMountMode         string
 	InheritUserIDs          bool
-	EnableCASFS             bool
 }
 
 // dockerCommandContainer containerizes a command's execution using a Docker container.
@@ -248,10 +248,16 @@ func (r *dockerCommandContainer) hostConfig(workDir string) *dockercontainer.Hos
 }
 
 func copyOutputs(reader io.Reader, result *interfaces.CommandResult) error {
-	var stdout, stderr bytes.Buffer
-	_, err := stdcopy.StdCopy(&stdout, &stderr, reader)
-	result.Stdout = stdout.Bytes()
-	result.Stderr = stderr.Bytes()
+	var stdoutBuf, stderrBuf bytes.Buffer
+
+	stdout, stderr := io.Writer(&stdoutBuf), io.Writer(&stderrBuf)
+	if *commandutil.DebugStreamCommandOutputs {
+		stdout, stderr = io.MultiWriter(stdout, os.Stdout), io.MultiWriter(stderr, os.Stderr)
+	}
+
+	_, err := stdcopy.StdCopy(stdout, stderr, reader)
+	result.Stdout = stdoutBuf.Bytes()
+	result.Stderr = stderrBuf.Bytes()
 	return err
 }
 

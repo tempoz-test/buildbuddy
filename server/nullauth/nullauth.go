@@ -39,8 +39,8 @@ func (a *NullAuthenticator) Logout(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, "/", http.StatusTemporaryRedirect)
 }
 
-func (a *NullAuthenticator) ParseAPIKeyFromString(input string) string {
-	return ""
+func (a *NullAuthenticator) ParseAPIKeyFromString(input string) (string, error) {
+	return "", nil
 }
 
 func (a *NullAuthenticator) AuthContextFromAPIKey(ctx context.Context, apiKey string) context.Context {
@@ -49,4 +49,12 @@ func (a *NullAuthenticator) AuthContextFromAPIKey(ctx context.Context, apiKey st
 
 func (a *NullAuthenticator) AuthenticateGRPCRequest(ctx context.Context) (interfaces.UserInfo, error) {
 	return nil, nil
+}
+
+func (a *NullAuthenticator) TrustedJWTFromAuthContext(ctx context.Context) string {
+	return ""
+}
+
+func (a *NullAuthenticator) AuthContextFromTrustedJWT(ctx context.Context, jwt string) context.Context {
+	return ctx
 }

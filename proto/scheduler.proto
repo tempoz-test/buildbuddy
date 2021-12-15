@@ -19,9 +19,14 @@ message LeaseTaskRequest {
   // will be returned containing the serialized task and duration of the lease.
   string task_id = 1;
 
-  // A bit that indicates this is the last LeaseTaskRequest and this
-  // lease can now be closed.
+  // Indicates that the leased task has been completed and can be deleted.
+  // Mutually exclusive with `release`.
   bool finalize = 2;
+
+  // Indicates that the lease should be released without finalizing (deleting)
+  // the task.
+  // Mutually exclusive with `finalize`.
+  bool release = 3;
 }
 
 message LeaseTaskResponse {
@@ -44,6 +49,9 @@ message TaskSize {
 
   // The task's estimated cpu usage.
   int64 estimated_milli_cpu = 2;
+
+  // The task's estimated disk space requirement (beyond task inputs).
+  int64 estimated_free_disk_bytes = 3;
 }
 
 message SchedulingMetadata {
@@ -71,6 +79,8 @@ message ScheduleTaskResponse {
 
 message ReEnqueueTaskRequest {
   string task_id = 1;
+  // Optional reason for the re-enqueue (may be visible to end-user).
+  string reason = 2;
 }
 
 message ReEnqueueTaskResponse {
@@ -106,6 +116,11 @@ message RegisterExecutorRequest {
   ExecutionNode node = 1;
 }
 
+message ShuttingDownRequest {
+  // Task IDs that are in the executor queue.
+  repeated string task_id = 1;
+}
+
 message RegisterAndStreamWorkRequest {
   // Only one of the fields should be sent. oneofs not used due to awkward Go
   // APIs.
@@ -118,6 +133,9 @@ message RegisterAndStreamWorkRequest {
 
   // Response to a previous EnqueueTaskReservationRequest.
   EnqueueTaskReservationResponse enqueue_task_reservation_response = 2;
+
+  // Notifications to the scheduler that this executor is going away.
+  ShuttingDownRequest shutting_down_request = 3;
 }
 
 message RegisterAndStreamWorkResponse {
@@ -194,7 +212,16 @@ message GetExecutionNodesRequest {
 message GetExecutionNodesResponse {
   context.ResponseContext response_context = 1;
 
-  repeated ExecutionNode execution_node = 2;
+  repeated Executor executor = 2;
+
+  message Executor {
+    ExecutionNode node = 1;
+
+    // Whether tasks can be routed to this node. If this is false, it is likely
+    // due to a misconfiguration.
+    bool enabled = 2;
+  }
+
   bool user_owned_executors_supported = 3;
 }
 

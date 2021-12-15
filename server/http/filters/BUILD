@@ -9,6 +9,7 @@ go_library(
         "//server/environment",
         "//server/http/protolet",
         "//server/metrics",
+        "//server/role_filter",
         "//server/util/log",
         "//server/util/status",
         "//server/util/uuid",

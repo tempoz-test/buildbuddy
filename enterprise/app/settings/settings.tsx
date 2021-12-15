@@ -28,20 +28,25 @@ function isTabId(id: string): id is TabId {
   return TAB_IDS.has(id);
 }
 
-const DEFAULT_TAB_ID = TabId.OrgDetails;
-
 export default class SettingsComponent extends React.Component<SettingsProps> {
   componentWillMount() {
     document.title = `Settings | BuildBuddy`;
   }
 
+  private getDefaultTabId(): TabId {
+    if (router.canAccessOrgDetailsPage(this.props.user)) {
+      return TabId.OrgDetails;
+    }
+    return TabId.OrgApiKeys;
+  }
+
   private getActiveTabId(): TabId {
     if (this.props.path === "/settings" || this.props.path === "/settings/") {
-      return DEFAULT_TAB_ID;
+      return this.getDefaultTabId();
     }
     const path = this.props.path.substring("/settings/".length);
     if (!isTabId(path)) {
-      return DEFAULT_TAB_ID;
+      return this.getDefaultTabId();
     }
     return path;
   }
@@ -49,6 +54,7 @@ export default class SettingsComponent extends React.Component<SettingsProps> {
   private gitHubLinkUrl(): string {
     const params = new URLSearchParams({
       group_id: this.props.user?.selectedGroup?.id,
+      user_id: this.props.user?.displayUser.userId.id,
       redirect_url: window.location.href,
     });
     return `/auth/github/link/?${params}`;
@@ -72,17 +78,21 @@ export default class SettingsComponent extends React.Component<SettingsProps> {
                 <div className="settings-tab-group-subtitle">{this.props.user?.selectedGroupName()}</div>
               </div>
               <div className="settings-tab-group">
-                <SettingsTab id={TabId.OrgDetails} activeTabId={activeTabId}>
-                  Org details
-                </SettingsTab>
-                {capabilities.userManagement && (
+                {router.canAccessOrgDetailsPage(this.props.user) && (
+                  <SettingsTab id={TabId.OrgDetails} activeTabId={activeTabId}>
+                    Org details
+                  </SettingsTab>
+                )}
+                {router.canAccessOrgMembersPage(this.props.user) && (
                   <SettingsTab id={TabId.OrgMembers} activeTabId={activeTabId}>
                     Members
                   </SettingsTab>
                 )}
-                <SettingsTab id={TabId.OrgGitHub} activeTabId={activeTabId}>
-                  GitHub link
-                </SettingsTab>
+                {router.canAccessOrgGitHubLinkPage(this.props.user) && (
+                  <SettingsTab id={TabId.OrgGitHub} activeTabId={activeTabId}>
+                    GitHub link
+                  </SettingsTab>
+                )}
                 <SettingsTab id={TabId.OrgApiKeys} activeTabId={activeTabId}>
                   API keys
                 </SettingsTab>

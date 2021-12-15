@@ -14,11 +14,13 @@ ts_library(
         "//app/components/dialog",
         "//app/components/input",
         "//app/components/modal",
+        "//app/components/spinner",
         "//app/errors",
         "//app/service",
         "//app/util:errors",
         "//proto:api_key_ts_proto",
         "@npm//@types/react",
+        "@npm//lucide-react",
         "@npm//react",
     ],
 )

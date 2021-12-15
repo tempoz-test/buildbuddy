@@ -14,6 +14,7 @@ import (
 	"github.com/buildbuddy-io/buildbuddy/server/terminal"
 	"github.com/buildbuddy-io/buildbuddy/server/util/keyval"
 	"github.com/buildbuddy-io/buildbuddy/server/util/status"
+	"google.golang.org/protobuf/proto"
 
 	elpb "github.com/buildbuddy-io/buildbuddy/proto/eventlog"
 	inpb "github.com/buildbuddy-io/buildbuddy/proto/invocation"
@@ -35,7 +36,7 @@ const (
 	numReadWorkers = 16
 )
 
-func getEventLogPathFromInvocationId(invocationId string) string {
+func GetEventLogPathFromInvocationId(invocationId string) string {
 	return invocationId + "/chunks/log/eventlog"
 }
 
@@ -52,7 +53,7 @@ func GetEventLogChunk(ctx context.Context, env environment.Env, req *elpb.GetEve
 
 	invocationInProgress := inv.InvocationStatus == int64(inpb.Invocation_PARTIAL_INVOCATION_STATUS)
 	c := chunkstore.New(env.GetBlobstore(), &chunkstore.ChunkstoreOptions{})
-	eventLogPath := getEventLogPathFromInvocationId(req.InvocationId)
+	eventLogPath := GetEventLogPathFromInvocationId(req.InvocationId)
 
 	// Get the id of the last chunk on disk after the last id stored in the db
 	lastChunkId, err := c.GetLastChunkId(ctx, eventLogPath, inv.LastChunkId)
@@ -68,6 +69,20 @@ func GetEventLogChunk(ctx context.Context, env environment.Env, req *elpb.GetEve
 
 		// No chunks have been written for this invocation
 		if invocationInProgress {
+			// If the invocation is in progress and the chunk requested is not on
+			// disk, check the cache to see if the live chunk is being requested.
+			liveChunk := &elpb.LiveEventLogChunk{}
+			if err := keyval.GetProto(ctx, env.GetKeyValStore(), eventLogPath, liveChunk); err == nil {
+				if req.ChunkId == liveChunk.ChunkId {
+					return &elpb.GetEventLogChunkResponse{
+						Buffer:      liveChunk.Buffer,
+						NextChunkId: liveChunk.ChunkId,
+						Live:        true,
+					}, nil
+				}
+			} else if !status.IsNotFoundError(err) {
+				return nil, err
+			}
 			// If the invocation is in progress, logs may be written in the future.
 			// Return an empty chunk with NextChunkId set to 0.
 			return &elpb.GetEventLogChunkResponse{
@@ -111,6 +126,8 @@ func GetEventLogChunk(ctx context.Context, env environment.Env, req *elpb.GetEve
 							Live:        true,
 						}, nil
 					}
+				} else if !status.IsNotFoundError(err) {
+					return nil, err
 				}
 			}
 
@@ -253,33 +270,17 @@ func (q *chunkQueue) pop(ctx context.Context) ([]byte, error) {
 }
 
 func NewEventLogWriter(ctx context.Context, b interfaces.Blobstore, c interfaces.KeyValStore, invocationId string) *EventLogWriter {
-	eventLogPath := getEventLogPathFromInvocationId(invocationId)
+	eventLogPath := GetEventLogPathFromInvocationId(invocationId)
 	chunkstoreOptions := &chunkstore.ChunkstoreOptions{
 		WriteBlockSize: defaultLogChunkSize,
 	}
-	var writeHook func(writeRequest *chunkstore.WriteRequest, writeResult *chunkstore.WriteResult, chunk []byte, volatileTail []byte, timeout, open bool)
+	eventLogWriter := &EventLogWriter{
+		keyValueStore: c,
+		eventLogPath:  eventLogPath,
+	}
+	var writeHook func(ctx context.Context, writeRequest *chunkstore.WriteRequest, writeResult *chunkstore.WriteResult, chunk []byte, volatileTail []byte)
 	if c != nil {
-		writeHook = func(writeRequest *chunkstore.WriteRequest, writeResult *chunkstore.WriteResult, chunk []byte, volatileTail []byte, timeout, open bool) {
-			if !open {
-				keyval.SetProto(ctx, c, eventLogPath, nil)
-				return
-			}
-			chunkId := chunkstore.ChunkIndexAsStringId(writeResult.LastChunkIndex + 1)
-			if chunkId == chunkstore.ChunkIndexAsStringId(math.MaxUint16) {
-				keyval.SetProto(ctx, c, eventLogPath, nil)
-				return
-			}
-			keyval.SetProto(
-				ctx,
-				c,
-				eventLogPath,
-				&elpb.LiveEventLogChunk{
-					ChunkId: chunkId,
-					Buffer:  append(chunk, volatileTail...),
-				},
-			)
-			return
-		}
+		writeHook = eventLogWriter.writeChunkToKeyValStore
 	}
 	chunkstoreWriterOptions := &chunkstore.ChunkstoreWriterOptions{
 		WriteTimeoutDuration: defaultChunkTimeout,
@@ -287,27 +288,61 @@ func NewEventLogWriter(ctx context.Context, b interfaces.Blobstore, c interfaces
 		WriteHook:            writeHook,
 	}
 	cw := chunkstore.New(b, chunkstoreOptions).Writer(ctx, eventLogPath, chunkstoreWriterOptions)
-	return &EventLogWriter{
-		WriteCloser: &ANSICursorBufferWriter{
-			WriteWithTailCloser: cw,
-			screenWriter:        terminal.NewScreenWriter(),
-		},
-		chunkstoreWriter: cw,
+	eventLogWriter.WriteCloserWithContext = &ANSICursorBufferWriter{
+		WriteWithTailCloser: cw,
+		screenWriter:        terminal.NewScreenWriter(),
 	}
+	eventLogWriter.chunkstoreWriter = cw
+
+	return eventLogWriter
+}
+
+type WriteCloserWithContext interface {
+	Write(context.Context, []byte) (int, error)
+	Close(context.Context) error
 }
 
 type EventLogWriter struct {
-	io.WriteCloser
+	WriteCloserWithContext
 	chunkstoreWriter *chunkstore.ChunkstoreWriter
+	lastChunk        *elpb.LiveEventLogChunk
+	keyValueStore    interfaces.KeyValStore
+	eventLogPath     string
 }
 
-func (w *EventLogWriter) GetLastChunkId() string {
-	return chunkstore.ChunkIndexAsStringId(w.chunkstoreWriter.GetLastChunkIndex())
+func (w *EventLogWriter) writeChunkToKeyValStore(ctx context.Context, writeRequest *chunkstore.WriteRequest, writeResult *chunkstore.WriteResult, chunk []byte, volatileTail []byte) {
+	if writeResult.Close {
+		keyval.SetProto(ctx, w.keyValueStore, w.eventLogPath, nil)
+		return
+	}
+	chunkId := chunkstore.ChunkIndexAsStringId(writeResult.LastChunkIndex + 1)
+	if chunkId == chunkstore.ChunkIndexAsStringId(math.MaxUint16) {
+		keyval.SetProto(ctx, w.keyValueStore, w.eventLogPath, nil)
+		return
+	}
+	curChunk := &elpb.LiveEventLogChunk{
+		ChunkId: chunkId,
+		Buffer:  append(chunk, volatileTail...),
+	}
+	if proto.Equal(w.lastChunk, curChunk) {
+		return
+	}
+	keyval.SetProto(
+		ctx,
+		w.keyValueStore,
+		w.eventLogPath,
+		curChunk,
+	)
+	w.lastChunk = curChunk
+}
+
+func (w *EventLogWriter) GetLastChunkId(ctx context.Context) string {
+	return chunkstore.ChunkIndexAsStringId(w.chunkstoreWriter.GetLastChunkIndex(ctx))
 }
 
 type WriteWithTailCloser interface {
-	Close() error
-	WriteWithTail([]byte, []byte) (int, error)
+	Close(context.Context) error
+	WriteWithTail(context.Context, []byte, []byte) (int, error)
 }
 
 // Parses text passed into it as ANSI text and flushes it to the WriteCloser,
@@ -319,9 +354,9 @@ type ANSICursorBufferWriter struct {
 	screenWriter *terminal.ScreenWriter
 }
 
-func (w *ANSICursorBufferWriter) Write(p []byte) (int, error) {
+func (w *ANSICursorBufferWriter) Write(ctx context.Context, p []byte) (int, error) {
 	if p == nil || len(p) == 0 {
-		return w.WriteWithTailCloser.WriteWithTail(p, nil)
+		return w.WriteWithTailCloser.WriteWithTail(ctx, p, nil)
 	}
 	if _, err := w.screenWriter.Write(p); err != nil {
 		return 0, err
@@ -330,9 +365,9 @@ func (w *ANSICursorBufferWriter) Write(p []byte) (int, error) {
 	if len(popped) != 0 {
 		popped = append(popped, '\n')
 	}
-	return w.WriteWithTailCloser.WriteWithTail(popped, w.screenWriter.RenderAsANSI())
+	return w.WriteWithTailCloser.WriteWithTail(ctx, popped, w.screenWriter.RenderAsANSI())
 }
 
-func (w *ANSICursorBufferWriter) Close() error {
-	return w.WriteWithTailCloser.Close()
+func (w *ANSICursorBufferWriter) Close(ctx context.Context) error {
+	return w.WriteWithTailCloser.Close(ctx)
 }

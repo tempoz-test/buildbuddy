@@ -7,6 +7,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/buildbuddy-io/buildbuddy/enterprise/server/auth"
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/remote_execution/container"
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/remote_execution/containers/firecracker"
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/remote_execution/dirtools"
@@ -33,6 +34,7 @@ import (
 	durationpb "github.com/golang/protobuf/ptypes/duration"
 	timestamppb "github.com/golang/protobuf/ptypes/timestamp"
 	tspb "github.com/golang/protobuf/ptypes/timestamp"
+	gcodes "google.golang.org/grpc/codes"
 	gstatus "google.golang.org/grpc/status"
 )
 
@@ -56,11 +58,10 @@ const (
 )
 
 type Executor struct {
-	env         environment.Env
-	runnerPool  *runner.Pool
-	id          string
-	name        string
-	enableCASFS bool
+	env        environment.Env
+	runnerPool *runner.Pool
+	id         string
+	name       string
 }
 
 type Options struct {
@@ -86,23 +87,25 @@ func NewExecutor(env environment.Env, id string, options *Options) (*Executor, e
 		return nil, err
 	}
 	s := &Executor{
-		env:         env,
-		id:          id,
-		name:        name,
-		runnerPool:  runnerPool,
-		enableCASFS: executorConfig.EnableCASFS,
+		env:        env,
+		id:         id,
+		name:       name,
+		runnerPool: runnerPool,
 	}
 	if hc := env.GetHealthChecker(); hc != nil {
 		hc.RegisterShutdownFunction(runnerPool.Shutdown)
 	} else {
 		return nil, status.FailedPreconditionError("Missing health checker in env")
 	}
-	go s.runnerPool.WarmupDefaultImage()
 	return s, nil
 }
 
 func (s *Executor) Name() string {
 	return s.name
+}
+
+func (s *Executor) Warmup() {
+	s.runnerPool.WarmupImages()
 }
 
 func diffTimestamps(startPb, endPb *tspb.Timestamp) time.Duration {
@@ -146,11 +149,27 @@ func parseTimeout(timeout *durationpb.Duration, maxDuration time.Duration) (time
 	return requestDuration, nil
 }
 
-func (s *Executor) ExecuteTaskAndStreamResults(ctx context.Context, task *repb.ExecutionTask, stream operation.StreamLike) error {
+func isBazelRetryableError(taskError error) bool {
+	if gstatus.Code(taskError) == gcodes.ResourceExhausted {
+		return true
+	}
+	if gstatus.Code(taskError) == gcodes.FailedPrecondition {
+		if len(gstatus.Convert(taskError).Details()) > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+func shouldRetry(taskError error) bool {
+	return !isBazelRetryableError(taskError)
+}
+
+func (s *Executor) ExecuteTaskAndStreamResults(ctx context.Context, task *repb.ExecutionTask, stream operation.StreamLike) (retry bool, err error) {
 	// From here on in we use these liberally, so check that they are setup properly
 	// in the environment.
 	if s.env.GetActionCacheClient() == nil || s.env.GetByteStreamClient() == nil || s.env.GetContentAddressableStorageClient() == nil {
-		return status.FailedPreconditionError("No connection to cache backend.")
+		return false, status.FailedPreconditionError("No connection to cache backend.")
 	}
 
 	ctx, span := tracing.StartSpan(ctx)
@@ -163,7 +182,15 @@ func (s *Executor) ExecuteTaskAndStreamResults(ctx context.Context, task *repb.E
 	acClient := s.env.GetActionCacheClient()
 
 	stateChangeFn := operation.GetStateChangeFunc(stream, taskID, adInstanceDigest)
-	finishWithErrFn := operation.GetFinishWithErrFunc(stream, taskID, adInstanceDigest)
+	finishWithErrFn := func(finalErr error) (retry bool, err error) {
+		if shouldRetry(finalErr) {
+			return true, finalErr
+		}
+		if err := operation.PublishOperationDone(stream, taskID, adInstanceDigest, finalErr); err != nil {
+			return true, err
+		}
+		return false, finalErr
+	}
 
 	md := &repb.ExecutedActionMetadata{
 		Worker:               s.name,
@@ -174,14 +201,14 @@ func (s *Executor) ExecuteTaskAndStreamResults(ctx context.Context, task *repb.E
 
 	if !req.GetSkipCacheLookup() {
 		if err := stateChangeFn(repb.ExecutionStage_CACHE_CHECK, operation.InProgressExecuteResponse()); err != nil {
-			return err // CHECK (these errors should not happen).
+			return true, err
 		}
 		actionResult, err := cachetools.GetActionResult(ctx, acClient, adInstanceDigest)
 		if err == nil {
 			if err := stateChangeFn(repb.ExecutionStage_COMPLETED, operation.ExecuteResponseWithResult(actionResult, nil /*=summary*/, codes.OK)); err != nil {
-				return err // CHECK (these errors should not happen).
+				return true, err
 			}
-			return nil
+			return false, nil
 		}
 	}
 
@@ -189,7 +216,7 @@ func (s *Executor) ExecuteTaskAndStreamResults(ctx context.Context, task *repb.E
 	if err != nil {
 		return finishWithErrFn(status.UnavailableErrorf("Error creating runner for command: %s", err.Error()))
 	}
-	if err := r.PrepareForTask(ctx, task); err != nil {
+	if err := r.PrepareForTask(ctx); err != nil {
 		return finishWithErrFn(err)
 	}
 
@@ -216,8 +243,8 @@ func (s *Executor) ExecuteTaskAndStreamResults(ctx context.Context, task *repb.E
 		OutputFiles:        task.GetCommand().GetOutputFiles(),
 	}
 
-	if s.env.GetConfigurator().GetExecutorConfig().EnableCASFS && r.PlatformProperties.EnableCASFS {
-		// Unlike other "container" implementations, for Firecracker CASFS is mounted inside the guest VM so we need to
+	if s.env.GetConfigurator().GetExecutorConfig().EnableVFS && r.PlatformProperties.EnableVFS {
+		// Unlike other "container" implementations, for Firecracker VFS is mounted inside the guest VM so we need to
 		// pass the layout information to the implementation.
 		if fc, ok := r.Container.Delegate.(*firecracker.FirecrackerContainer); ok {
 			fc.SetTaskFileSystemLayout(layout)
@@ -233,25 +260,31 @@ func (s *Executor) ExecuteTaskAndStreamResults(ctx context.Context, task *repb.E
 			return finishWithErrFn(err)
 		}
 	}
-	if r.CASFS != nil {
-		if err := r.CASFS.PrepareForTask(ctx, task.GetExecutionId(), layout); err != nil {
+	if r.VFS != nil {
+		if err := r.VFS.PrepareForTask(ctx, task.GetExecutionId()); err != nil {
 			return finishWithErrFn(err)
 		}
 	}
 
 	rxInfo := &dirtools.TransferInfo{}
-	// Don't download inputs if the FUSE-based filesystem is enabled.
-	// TODO(vadim): integrate CASFS stats
-	if r.CASFS == nil {
+	// Don't download inputs or add the CI runner if the FUSE-based filesystem is
+	// enabled.
+	// TODO(vadim): integrate VFS stats
+	if r.VFS == nil {
 		rxInfo, err = r.Workspace.DownloadInputs(ctx, inputTree)
 		if err != nil {
 			return finishWithErrFn(err)
+		}
+		if r.PlatformProperties.WorkflowID != "" {
+			if err := r.Workspace.AddCIRunner(); err != nil {
+				return finishWithErrFn(err)
+			}
 		}
 	}
 	md.InputFetchCompletedTimestamp = ptypes.TimestampNow()
 
 	if err := stateChangeFn(repb.ExecutionStage_EXECUTING, operation.InProgressExecuteResponse()); err != nil {
-		return err // CHECK (these errors should not happen).
+		return true, err
 	}
 	md.ExecutionStartTimestamp = ptypes.TimestampNow()
 	maxDuration := infiniteDuration
@@ -268,7 +301,7 @@ func (s *Executor) ExecuteTaskAndStreamResults(ctx context.Context, task *repb.E
 
 	cmdResultChan := make(chan *interfaces.CommandResult, 1)
 	go func() {
-		cmdResultChan <- r.Run(ctx, task.GetCommand())
+		cmdResultChan <- r.Run(ctx)
 	}()
 
 	// Run a timer that periodically sends update messages back
@@ -281,24 +314,13 @@ func (s *Executor) ExecuteTaskAndStreamResults(ctx context.Context, task *repb.E
 			updateTicker.Stop()
 		case <-updateTicker.C:
 			if err := stateChangeFn(repb.ExecutionStage_EXECUTING, operation.InProgressExecuteResponse()); err != nil {
-				return status.UnavailableErrorf("could not publish periodic execution update for %q: %s", taskID, err)
+				return true, status.UnavailableErrorf("could not publish periodic execution update for %q: %s", taskID, err)
 			}
 		}
 	}
 
 	if cmdResult.ExitCode != 0 {
 		log.Debugf("%q finished with non-zero exit code (%d). Stdout: %s, Stderr: %s", taskID, cmdResult.ExitCode, cmdResult.Stdout, cmdResult.Stderr)
-	}
-
-	// Only upload action outputs if the error is something that the client can
-	// use the action outputs to debug.
-	isActionableClientErr := gstatus.Code(cmdResult.Error) == codes.DeadlineExceeded
-	if cmdResult.Error != nil && !isActionableClientErr {
-		// These errors are failure-specific. Pass through unchanged.
-		log.Warningf("Task %q command finished with error: %s", taskID, cmdResult.Error)
-		return finishWithErrFn(cmdResult.Error)
-	} else {
-		log.Infof("Task %q command finished with error: %v", taskID, cmdResult.Error)
 	}
 
 	ctx, cancel = background.ExtendContextForFinalization(ctx, uploadDeadlineExtension)
@@ -333,11 +355,17 @@ func (s *Executor) ExecuteTaskAndStreamResults(ctx context.Context, task *repb.E
 	metrics.FileUploadCount.Observe(float64(txInfo.FileCount))
 	metrics.FileUploadSizeBytes.Observe(float64(txInfo.BytesTransferred))
 	metrics.FileUploadDurationUsec.Observe(float64(txInfo.TransferDuration.Microseconds()))
-	observeStageDuration("queued", md.GetQueuedTimestamp(), md.GetWorkerStartTimestamp())
-	observeStageDuration("input_fetch", md.GetInputFetchStartTimestamp(), md.GetInputFetchCompletedTimestamp())
-	observeStageDuration("execution", md.GetExecutionStartTimestamp(), md.GetExecutionCompletedTimestamp())
-	observeStageDuration("output_upload", md.GetOutputUploadStartTimestamp(), md.GetOutputUploadCompletedTimestamp())
-	observeStageDuration("worker", md.GetWorkerStartTimestamp(), md.GetWorkerCompletedTimestamp())
+
+	groupID := interfaces.AuthAnonymousUser
+	if u, err := auth.UserFromTrustedJWT(ctx); err == nil {
+		groupID = u.GetGroupID()
+	}
+
+	observeStageDuration(groupID, "queued", md.GetQueuedTimestamp(), md.GetWorkerStartTimestamp())
+	observeStageDuration(groupID, "input_fetch", md.GetInputFetchStartTimestamp(), md.GetInputFetchCompletedTimestamp())
+	observeStageDuration(groupID, "execution", md.GetExecutionStartTimestamp(), md.GetExecutionCompletedTimestamp())
+	observeStageDuration(groupID, "output_upload", md.GetOutputUploadStartTimestamp(), md.GetOutputUploadCompletedTimestamp())
+	observeStageDuration(groupID, "worker", md.GetWorkerStartTimestamp(), md.GetWorkerCompletedTimestamp())
 
 	execSummary := &espb.ExecutionSummary{
 		IoStats: &espb.IOStats{
@@ -358,10 +386,10 @@ func (s *Executor) ExecuteTaskAndStreamResults(ctx context.Context, task *repb.E
 		return finishWithErrFn(err) // CHECK (these errors should not happen).
 	}
 	finishedCleanly = true
-	return nil
+	return false, nil
 }
 
-func observeStageDuration(stage string, start *timestamppb.Timestamp, end *timestamppb.Timestamp) {
+func observeStageDuration(groupID string, stage string, start *timestamppb.Timestamp, end *timestamppb.Timestamp) {
 	startTime, err := ptypes.Timestamp(start)
 	if err != nil {
 		log.Warningf("Could not parse timestamp for '%s' stage: %s", stage, err)
@@ -380,6 +408,7 @@ func observeStageDuration(stage string, start *timestamppb.Timestamp, end *times
 	}
 	duration := endTime.Sub(startTime)
 	metrics.RemoteExecutionExecutedActionMetadataDurationsUsec.With(prometheus.Labels{
+		metrics.GroupID:                  groupID,
 		metrics.ExecutedActionStageLabel: stage,
 	}).Observe(float64(duration / time.Microsecond))
 }
