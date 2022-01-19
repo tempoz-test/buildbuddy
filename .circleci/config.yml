@@ -26,7 +26,7 @@ jobs:
           command: pyenv global 3.10.2
       - run:
           name: Update Python Alternatives
-          command: update-alternatives --install /usr/bin/python python /usr/bin/python3.10 1
+          command: update-alternatives --install /usr/bin/python python /usr/bin/python3 1
       - run:
           name: Run tests
           command: |
