@@ -23,7 +23,7 @@ jobs:
           command: sudo npm install --global @bazel/bazelisk @bazel/ibazel @bazel/buildifier
       - run:
           name: Set Python Version
-          command: pyenv global 3.10
+          command: pyenv global 3.10.2
       - run:
           name: Update Python Alternatives
           command: update-alternatives --install /usr/bin/python python /usr/bin/python3.10 1
