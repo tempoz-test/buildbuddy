@@ -22,6 +22,9 @@ jobs:
           name: Install Bazelisk
           command: sudo npm install --global @bazel/bazelisk @bazel/ibazel @bazel/buildifier
       - run:
+          name: Set Python Version
+          command: pyenv global 3.10.2
+      - run:
           name: Run tests
           command: |
             mkdir -p /tmp/test-reports
