@@ -25,6 +25,9 @@ jobs:
           name: Set Python Version
           command: pyenv global 3.10.2
       - run:
+          name: Update Python Alternatives
+          command: update-alternatives --install /usr/bin/python python /usr/bin/python3.10.2 1
+      - run:
           name: Run tests
           command: |
             mkdir -p /tmp/test-reports
