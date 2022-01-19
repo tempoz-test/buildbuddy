@@ -34,15 +34,15 @@ genrule(
     visibility = ["//visibility:public"],
 )
 
-pkg_tar(
-    name = "bazel_binaries_tar",
-    srcs = [
-        ":bazel-3.7_crossplatform",
-        ":bazel-4.1_crossplatform",
-    ],
-    package_dir = "/bazel",
-    visibility = ["//visibility:public"],
-)
+# pkg_tar(
+#     name = "bazel_binaries_tar",
+#     srcs = [
+#         ":bazel-3.7_crossplatform",
+#         ":bazel-4.1_crossplatform",
+#     ],
+#     package_dir = "/bazel",
+#     visibility = ["//visibility:public"],
+# )
 
 go_library(
     name = "bazel",
