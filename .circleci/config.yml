@@ -25,9 +25,9 @@ jobs:
           key: go-mod-v4-{{ checksum "go.sum" }}
           paths:
             - "/go/pkg/mod"
-      - run:
-          name: Install NPM
-          command: sudo apt-get install npm
+      # - run:
+      #     name: Install NPM
+      #     command: sudo apt-get install npm
       - run:
           name: Install Bazelisk
           command: sudo npm install --global @bazel/bazelisk @bazel/ibazel @bazel/buildifier
